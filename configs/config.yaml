@@ -1,0 +1,125 @@
+# =============================================================================
+# Entity Resolution - main configuration
+# =============================================================================
+# Every path in this file is RELATIVE to the repository root by default, so a
+# fresh clone runs without editing anything as long as the data lives in
+# ./train and ./test.
+#
+# On the HPC (or anywhere the data lives elsewhere) you do NOT need to edit this
+# file - override at runtime with environment variables instead:
+#
+#   export ER_DATA_ROOT=/scratch/challenge/data/train
+#   export ER_TEST_DATA_ROOT=/scratch/challenge/data/test
+#   export ER_WORK_DIR=/scratch/$USER/er_outputs
+#
+# Precedence: environment variable > config.yaml > built-in default.
+# =============================================================================
+
+project:
+  name: entity-resolution
+  seed: 42
+
+paths:
+  # Directory holding the training TSVs. The challenge dataset is NOT committed
+  # to git; see .gitignore.
+  data_root: "train"
+  test_data_root: "test"
+
+  # File names inside data_root / test_data_root.
+  files:
+    train:
+      source1: "train_source1.tsv"
+      source2: "train_source2.tsv"
+      source3: "train_source3.tsv"
+      ground_truth: "train_ground_truth.tsv"
+    test:
+      source1: "test_source1.tsv"
+      source2: "test_source2.tsv"
+      source3: "test_source3.tsv"
+
+  # All generated artifacts. Safe to delete; regenerate with the scripts.
+  work_dir: "outputs"
+  prepared_dir: "outputs/prepared"
+  index_dir: "outputs/indexes"
+  candidates_dir: "outputs/candidates"
+  log_dir: "logs"
+
+# TSV column names. Change here (not in code) if the challenge renames columns.
+columns:
+  entity_id: "entity_id"
+  name: "business_name"
+  address: "business_address"
+  country: "country"
+  gt_source1_id: "source1_entity_id"
+  gt_matched_ids: "matched_entity_ids"
+
+io:
+  # Rows per chunk when streaming the raw TSVs.
+  # Peak RAM scales with chunksize, not with dataset size.
+  chunksize: 500000
+  # "tsv" always works. "parquet" is faster and smaller but needs pyarrow.
+  prepared_format: "tsv"
+  candidates_format: "tsv"
+  # null | "gzip" | "bz2" | "zip"
+  compression: null
+
+normalization:
+  # NFC | NFKC. NFKC folds compatibility forms (full-width, ligatures) which
+  # helps matching; it preserves Indic scripts and their combining marks.
+  unicode_form: "NFKC"
+  # Fold diacritics on LATIN characters only (e.g. "Léarning" -> "learning").
+  # Latin-only by design: NFD-stripping every script would delete the Devanagari
+  # and Kannada combining marks that carry the actual phonetics.
+  fold_latin_accents: true
+  # lower | casefold. "lower" is the conservative default; "casefold" also maps
+  # e.g. German "ß" -> "ss".
+  case_mode: "lower"
+  # Map punctuation and symbols to a space so they act as token boundaries.
+  punctuation_to_space: true
+  # Truncate absurdly long fields (some addresses/names are thousands of chars).
+  max_length: 512
+
+blocking:
+  # Each blocker is a candidate generator. The final candidate set is the UNION
+  # over all enabled blockers. Blocking only proposes pairs; it never decides
+  # whether a pair is a match.
+  exact_name:
+    enabled: true
+    # Which normalized field to key on:
+    #   name_norm -> "orelee s barbershop"   (token preserving)
+    #   name_key  -> "oreleesbarbershop"     (all separators removed)
+    key: "name_norm"
+
+  # ---- Roadmap: implemented in later milestones, disabled for now ----
+  token:
+    enabled: false
+  char_ngram:
+    enabled: false
+  tfidf:
+    enabled: false
+  dense:
+    enabled: false
+
+  # Safety valve: cap candidates per (S1, source). 0 = unlimited.
+  # Exact-name blocking is naturally low-volume, so 0 is fine here.
+  max_candidates_per_source: 0
+
+evaluation:
+  split:
+    # Validation MUST be split by S1 entity so that all pairs of one S1 land in
+    # the same split. Splitting by pair would leak.
+    enabled: true
+    val_fraction: 0.2
+    # hash -> deterministic by entity id (reproducible across runs/machines)
+    # random -> seeded shuffle of the S1 list
+    mode: "hash"
+
+  # How to treat the 123,247 S1 entities whose ground truth is empty.
+  #   "exclude"  -> macro-average over entities that have >=1 true match
+  #   "score_zero" -> empty-GT entity scores 0 if we predicted anything, 1 if not
+  # Both are always reported; this picks which one is labelled "primary".
+  zero_match_policy: "exclude"
+
+  # K values to evaluate once blocking is combined with ranked retrieval.
+  # Do NOT assume K=50; these are measured against validation.
+  k_values: [10, 25, 50, 100, 200]

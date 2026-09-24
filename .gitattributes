@@ -1,0 +1,11 @@
+# Normalize line endings so a clone on the HPC (Linux) gets LF, regardless of the
+# fact that this repository was authored on Windows.
+* text=auto eol=lf
+
+# Binary artifacts - never touched by line-ending conversion.
+*.npy binary
+*.npz binary
+*.bin binary
+*.parquet binary
+*.gz binary
+*.ipynb text eol=lf
