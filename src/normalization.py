@@ -272,6 +272,27 @@ def normalize_text(value: Any, **kwargs: Any) -> str:
     return Normalizer(**kwargs).text(value)
 
 
+def strip_separators(values: pd.Series) -> pd.Series:
+    """Separator-free form of an already-normalized string Series.
+
+    Produces exactly what :meth:`Normalizer.key` produces for the same raw text,
+    but without normalizing a second time.
+
+    Safe because normalization has already collapsed every run of whitespace to a
+    single U+0020 and stripped both ends (see :meth:`Normalizer.text`): the only
+    separator left to remove is the space itself. Characters that could not
+    survive as whitespace were either mapped to a space or deleted by the
+    translation table, so no tab/newline/NBSP can reach this point.
+
+    Args:
+        values: a Series produced by ``Normalizer.series(..., "name")``.
+
+    Returns:
+        The same strings with spaces removed, as pandas ``string`` dtype.
+    """
+    return values.str.replace(" ", "", regex=False).astype("string")
+
+
 def add_normalized_columns(
     frame: pd.DataFrame,
     config: dict,
@@ -301,8 +322,14 @@ def add_normalized_columns(
     country_column = columns.get("country", "country")
 
     if name_column in frame.columns:
-        frame[NAME_NORM] = normalizer.series(frame[name_column], "name")
-        frame[NAME_KEY] = normalizer.series(frame[name_column], "key")
+        # Normalize the name ONCE and derive the separator-free key from the
+        # result. Calling series(..., "key") would re-run the whole
+        # NFKC/translate/case pipeline over the name column - the largest in the
+        # dataset - purely to strip spaces, and would deduplicate it a second
+        # time as well.
+        name_norm = normalizer.series(frame[name_column], "name")
+        frame[NAME_NORM] = name_norm
+        frame[NAME_KEY] = strip_separators(name_norm)
     if address_column in frame.columns:
         frame[ADDRESS_NORM] = normalizer.series(frame[address_column], "address")
     if country_column in frame.columns:

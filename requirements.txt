@@ -5,9 +5,16 @@
 #   source .venv/bin/activate        # Windows: .venv\Scripts\activate
 #   pip install -r requirements.txt
 #
-# The pipeline is designed so the CPU-only stages (prepare / index / candidates /
-# evaluate) need only the CORE set. GPU and model packages are optional extras at
-# the bottom - installing them is never required to run the pipeline.
+# CPU-FIRST, WITH OPTIONAL GPU ACCELERATION.
+#
+# The CORE set below runs every stage of the pipeline (prepare / index /
+# candidates / evaluate) on CPU, with no GPU and no model packages. The extras
+# at the bottom are consumed only by the accelerator-beneficial stages
+# (embedding generation, dense retrieval / FAISS, batched embedding similarity,
+# transformer / cross-encoder re-ranking). Those stages resolve their device
+# automatically via src/utils.resolve_device_from_config() and fall back to CPU
+# when the packages are absent. Nothing below the CORE block is required to run
+# the pipeline end to end.
 
 # ---- core: required for prepare_data / build_indexes / generate_candidates ----
 numpy>=1.24,<3
@@ -24,20 +31,31 @@ psutil>=5.9
 # pyarrow>=14.0
 
 # ---------------------------------------------------------------------------
-# Optional extras - only needed from milestone 2 onwards.
+# OPTIONAL EXTRAS - consumed only by the accelerator-capable stages.
+# None of these are needed to run the pipeline; CPU remains the fallback.
 # ---------------------------------------------------------------------------
-# Lexical pair features (token/ratio similarity):
+
+# Lexical pair features (token/ratio similarity). C++ and parallelizes across
+# cores; the review found no GPU edit-distance path worth using, so this stays a
+# CPU dependency even on a GPU node.
 # rapidfuzz>=3.6
 
-# Gradient-boosted trees for the match classifier:
+# Gradient-boosted trees for the match classifier. Permissive licence (MIT).
+# CPU by default: for ~20 features the GPU histogram path often loses to a
+# well-threaded CPU build, so benchmark device=cuda before enabling it.
 # scikit-learn>=1.3
 # lightgbm>=4.0
 
-# Multilingual embeddings + transformer stages. GPU is used automatically when
-# CUDA is available; CPU works but is slow.
+# Multilingual embeddings + transformer stages. The device is resolved
+# automatically - CUDA when available, CPU otherwise (CPU works but is slow).
+# Encoder weights must satisfy the challenge's licence and <=8B-parameter
+# constraints; record the chosen checkpoint in src/features.py.
 # torch>=2.1
 # transformers>=4.40
 # sentence-transformers>=2.7
 
-# Dense retrieval index (only if FAISS beats exact search at this scale):
+# Dense retrieval index (only if FAISS beats exact search at this scale).
+# GPU note: exact search needs the whole index resident in VRAM - ~15.8GB for
+# 10.3M x 384-dim vectors in float32, ~7.9GB in float16 - so a 16GB card needs
+# fp16, sharding, or an IVF/PQ index rather than a flat index.
 # faiss-cpu>=1.7  ; or faiss-gpu on a CUDA node

@@ -86,7 +86,7 @@ stable lives in `src/`; anything heavy is runnable from `scripts/`.
 
 The dataset is **not** in this repository. It lives on the HPC.
 
-### Local / HPC (CPU only is enough)
+### Local / HPC (CPU is enough - a GPU is an optional accelerator)
 
 ```bash
 git clone <repo-url> entity-resolution
@@ -97,9 +97,12 @@ source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Only `numpy`, `pandas` and `PyYAML` are required to run stages 1-4.
-`tqdm`/`psutil` add nicer progress and RSS logging. Everything GPU/model related
-in `requirements.txt` is commented out and optional - **no stage requires a GPU**.
+Only `numpy`, `pandas` and `PyYAML` are required to run stages 1-4, all on CPU.
+`tqdm`/`psutil` add nicer progress and RSS logging. The GPU and model packages in
+`requirements.txt` are commented out and optional: they are consumed only by the
+accelerator-beneficial stages, which resolve a device automatically and fall back
+to CPU when those packages are absent. See
+[Compute architecture](#compute-architecture).
 
 Verify the install:
 
@@ -133,6 +136,44 @@ python scripts/prepare_data.py --data-root /scratch/challenge/data/train --work-
 Precedence: CLI flag > environment variable > `config.yaml` > built-in default.
 
 Every script also accepts `--config /path/to/other.yaml`.
+
+---
+
+## Compute architecture
+
+**CPU-first, with automatic GPU acceleration for GPU-beneficial stages.**
+
+Every stage runs to completion on CPU, and CPU is the guaranteed fallback. Stages
+that benefit from an accelerator obtain one through `utils.resolve_device()` /
+`utils.resolve_device_from_config()` — never a hardcoded `"cuda"` — so the same
+code takes the GPU when one is present and falls back to CPU otherwise.
+`compute.device` in `config.yaml` pins the choice when you need it
+(`auto` | `cpu` | `cuda` | `cuda:N` | `mps`).
+
+| Stage | Compute | Why |
+|---|---|---|
+| Normalization | **CPU** | Unicode + regex string work. A GPU port would put the Indic combining-mark guarantee at risk for no meaningful gain |
+| Exact index build / lookup | **CPU** | `argsort` + `searchsorted` over a few million ints |
+| Candidate union / dedupe | **CPU** | Chunked per S1, so per-chunk volume is small; GPU transfer overhead would dominate |
+| Token / char n-gram blocking | **CPU** | Hash and posting arithmetic |
+| Lexical pair features | **CPU** (multiprocess) | `rapidfuzz` is C++ and parallelizes across cores; no GPU edit-distance path worth using |
+| GBDT training | **CPU by default** | For ~20 features the GPU histogram path often loses to a well-threaded CPU build — benchmark `device=cuda` before enabling |
+| **Embedding generation** | **GPU when available** | ~12.6M texts, one-time, embarrassingly parallel |
+| **Dense retrieval / FAISS** | **GPU when available** | Exact search at this scale is GPU-friendly; needs the index in VRAM (fp16 for 16GB cards) |
+| **Batched embedding similarity** | **GPU when available** | Gather + matmul over candidate pairs |
+| **Transformer / cross-encoder rerank** | **GPU when available** | Runs only on a small "uncertain" candidate band, so cost stays bounded |
+
+The CPU rows are measurement-driven decisions, not limitations. None of those
+stages should grow a GPU path without a benchmark showing it actually wins.
+
+Report what the current machine resolves to:
+
+```bash
+python -c "from src.utils import describe_device; print(describe_device())"
+```
+
+On a Slurm cluster, request a GPU only for the stages marked GPU above; the rest
+are CPU jobs. See [HPC notes](#hpc-notes).
 
 ---
 
@@ -193,6 +234,11 @@ Stage-by-stage reference:
   tracks the chunk size, not the dataset size.
 * `--overwrite` is off by default, so re-running a completed stage is a no-op
   (it verifies the existing artifact and skips).
+* Request a GPU node only for the stages marked GPU in
+  [Compute architecture](#compute-architecture); the rest are CPU jobs. Set
+  `compute.device: cpu` to force CPU on a mixed cluster, or `cuda` to fail loudly
+  when no GPU was granted - `auto` silently falls back to CPU, which is safe but
+  slow for the embedding stages.
 
 ---
 
@@ -404,8 +450,10 @@ explanation. Building a matcher now would mostly measure the blocker's recall.
   performs a network lookup; embeddings must come from a locally-run model.
 * **Model license and parameter-count constraints** apply to the final solution.
   Record the chosen encoder and its size in `src/features.py` before shipping.
-* **CPU must remain sufficient** for the whole pipeline. `utils.resolve_device()`
-  returns `cuda` when available and `cpu` otherwise; nothing is GPU-gated.
+* **CPU-first, GPU-accelerated where it pays.** No stage requires a GPU and no
+  stage hardcodes a device: `utils.resolve_device()` returns `cuda` when torch
+  and a GPU are present, and `cpu` otherwise. See
+  [Compute architecture](#compute-architecture) for the per-stage split.
 * **Never materialize the 22.8T cross product.** All stages are chunked and
   streamed; peak memory is governed by `io.chunksize`.
 

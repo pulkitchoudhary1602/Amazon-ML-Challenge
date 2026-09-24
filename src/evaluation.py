@@ -73,7 +73,7 @@ class CandidateEvaluation:
         print(format_report(metrics))
 
     The evaluator never holds the candidate table: it accumulates per-entity
-    counters with ``np.bincount``, so RAM is O(n_S1) regardless of how many
+    counters in place with ``np.add.at``, so RAM is O(n_S1) regardless of how many
     candidate pairs the file contains.
     """
 
@@ -99,7 +99,19 @@ class CandidateEvaluation:
         self._hit_counts = np.zeros(self.n_entities, dtype=np.int64)
         self._candidate_counts_by_source = {2: np.zeros(self.n_entities, dtype=np.int64), 3: np.zeros(self.n_entities, dtype=np.int64)}
         self._hit_counts_by_source = {2: np.zeros(self.n_entities, dtype=np.int64), 3: np.zeros(self.n_entities, dtype=np.int64)}
-        self._hits_at_k = {k: 0 for k in self.k_values}
+        # recall@K is accumulated PER ENTITY, not as one scalar per k, because the
+        # split masks arrive after the file has been read. A scalar numerator is
+        # counted over every entity in the candidate file, while the denominator
+        # (n_true_pairs) is masked by compute_metrics(s1_mask=...), so the val and
+        # train reports divided all-entity hits by split-only true pairs and
+        # printed figures above 100%. Per-entity accumulators reduce under the
+        # same mask as everything else, which makes the ratio structurally <= 1.
+        #
+        # int32, unlike the int64 counters above: this value is one entity's
+        # true-hit count within the first max(k) rows that entity owns, so it is
+        # bounded by that entity's candidate count. Five int64 arrays over 2.2M
+        # entities would add 88MB to the evaluator for no reachable benefit.
+        self._hits_at_k = {k: np.zeros(self.n_entities, dtype=np.int32) for k in self.k_values}
         self._unknown_s1 = 0
         self._n_candidate_rows = 0
 
@@ -157,19 +169,41 @@ class CandidateEvaluation:
                 trailing_s1 = int(owners[-1])
                 trailing_position = int(position_in_group[-1]) + 1
 
+            # np.add.at, NOT np.bincount. bincount looks like the obvious
+            # replacement and was measured as one: it needs a full-width result
+            # (minlength=n_entities) on every chunk, so an 8-chunk pass spends
+            # most of its time allocating and zeroing 8 x 2.2M int64 arrays. On
+            # the real shape - 3.3M rows over 2.2M entities in 500k-row chunks -
+            # that measured 60ms against 9.5ms for add.at, a 6x regression. The
+            # unbuffered scatter only pays for the rows it actually sees.
             np.add.at(self._candidate_counts, owners, 1)
-            self._hit_counts[owners[is_true]] += 1
+
+            # CORRECTNESS FIX, not a performance change.
+            # This was `self._hit_counts[owners[is_true]] += 1`, which is buffered
+            # fancy indexing: numpy gathers, adds one, then scatters - so repeated
+            # indices collapse. An entity that retrieved several true matches was
+            # credited with exactly ONE hit per chunk. Every recall figure - pair
+            # recall, macro entity recall, the S1 full/partial rates, candidate
+            # precision and the macro F0.5 built on them - was understated for
+            # every entity with two or more retrieved matches, which at this
+            # dataset's match distribution is most of the matched entities.
+            # add.at is unbuffered, so repeats accumulate.
+            if is_true.any():
+                np.add.at(self._hit_counts, owners[is_true], 1)
 
             source_codes = target_codes // 10**10
             for source_code, counts in self._candidate_counts_by_source.items():
                 mask = source_codes == source_code
                 if mask.any():
                     np.add.at(counts, owners[mask], 1)
-                    self._hit_counts_by_source[source_code][owners[mask & is_true]] += 1
+                    true_in_source = mask & is_true
+                    if true_in_source.any():
+                        np.add.at(self._hit_counts_by_source[source_code], owners[true_in_source], 1)
 
             for k in self.k_values:
-                in_top_k = position_in_group < k
-                self._hits_at_k[k] += int(np.count_nonzero(is_true & in_top_k))
+                true_in_top_k = is_true & (position_in_group < k)
+                if true_in_top_k.any():
+                    np.add.at(self._hits_at_k[k], owners[true_in_top_k], 1)
 
             self._n_candidate_rows = rows_seen
             self.log.info("  evaluated %s candidate rows", fmt_int(rows_seen))
@@ -197,6 +231,7 @@ class CandidateEvaluation:
                 code: (self._candidate_counts_by_source[code], self._hit_counts_by_source[code])
                 for code in self._candidate_counts_by_source
             }
+            hits_at_k = {k: int(counts.sum()) for k, counts in self._hits_at_k.items()}
         else:
             mask = np.asarray(s1_mask, dtype=bool)
             lengths = self.true_lengths[mask]
@@ -209,6 +244,7 @@ class CandidateEvaluation:
                 )
                 for code in self._candidate_counts_by_source
             }
+            hits_at_k = {k: int(counts[mask].sum()) for k, counts in self._hits_at_k.items()}
 
         n_entities = len(lengths)
         n_with_matches = int(np.count_nonzero(lengths > 0))
@@ -223,6 +259,14 @@ class CandidateEvaluation:
         fully_retrieved = (lengths > 0) & (hits >= lengths)
         partially_retrieved = (lengths > 0) & (hits > 0)
 
+        # Macro per-entity recall: the mean, over entities that have at least one
+        # true match, of that entity's own recall. This is the recall that pairs
+        # with the per-entity F0.5 the challenge computes - pair-level recall is
+        # volume-weighted, so an entity with eleven matches counts eleven times
+        # there and once here. Reported next to the ceiling it implies:
+        # F0.5 = 1.25r / (0.25 + r) when precision is perfect.
+        macro_recall = _macro_entity_recall(lengths, hits)
+
         metrics: dict[str, Any] = {
             "split": split_label,
             "n_s1_entities": n_entities,
@@ -235,6 +279,8 @@ class CandidateEvaluation:
             # --- recall ---
             "true_pairs_retrieved": n_hits,
             "blocking_recall_pair": _safe_div(n_hits, n_true_pairs),
+            "macro_recall_entity": macro_recall,
+            "f05_ceiling_from_macro_recall": _f05_ceiling(macro_recall),
             "s1_full_recall_rate": _safe_div(int(fully_retrieved.sum()), n_with_matches),
             "s1_partial_recall_rate": _safe_div(int(partially_retrieved.sum()), n_with_matches),
             # --- volume ---
@@ -264,8 +310,14 @@ class CandidateEvaluation:
         # order, which is arbitrary. It is reported because it bounds what any
         # future re-ranking can achieve, and because it makes the cost of
         # capping candidate volume explicit.
+        #
+        # Numerator and denominator are both restricted to the same S1 split:
+        # hits_at_k is summed over exactly the entities n_true_pairs counts.
+        # Candidate pairs are deduplicated upstream (the blockers union with
+        # np.unique), so the numerator is a subset of the denominator and the
+        # ratio cannot exceed 1.
         metrics["recall_at_k_file_order"] = {
-            str(k): _safe_div(self._hits_at_k[k], n_true_pairs) for k in self.k_values
+            str(k): _safe_div(hits_at_k[k], n_true_pairs) for k in self.k_values
         }
 
         # --- per-source breakdown ---
@@ -283,6 +335,7 @@ class CandidateEvaluation:
                 "n_candidates": int(counts.sum()),
                 "true_pairs_retrieved": n_hits_source,
                 "blocking_recall_pair": _safe_div(n_hits_source, n_true_source),
+                "macro_recall_entity": _macro_entity_recall(true_for_source, source_hits),
                 "s1_full_recall_rate": _safe_div(int(source_full.sum()), int((true_for_source > 0).sum())),
                 "s1_partial_recall_rate": _safe_div(
                     int(((true_for_source > 0) & (source_hits > 0)).sum()), int((true_for_source > 0).sum())
@@ -398,6 +451,30 @@ def _safe_div(numerator: float, denominator: float) -> float:
     return float(numerator) / float(denominator)
 
 
+def _macro_entity_recall(lengths: np.ndarray, hits: np.ndarray) -> float:
+    """Mean per-entity recall over entities that have at least one true match.
+
+    Entities with no true matches are excluded: "correctly predicting no match"
+    is a precision question, not a recall one, and counting them as recall 1.0
+    (or 0.0) would make the number meaningless.
+    """
+    eligible = lengths > 0
+    if not eligible.any():
+        return 0.0
+    recall = hits[eligible].astype(np.float64) / lengths[eligible].astype(np.float64)
+    return float(recall.mean())
+
+
+def _f05_ceiling(macro_recall: float) -> float:
+    """Macro F0.5 achievable at ``macro_recall`` when precision is perfect.
+
+    With beta=0.5, ``F = 1.25 * P * R / (0.25 * P + R)``; at ``P = 1`` this
+    reduces to ``1.25 * R / (0.25 + R)``. Useful because it converts a recall
+    number into the score it caps, which is the currency the challenge grades in.
+    """
+    return _safe_div(1.25 * macro_recall, 0.25 + macro_recall)
+
+
 def _iter_candidate_chunks(path: Path, chunksize: int):
     """Stream the candidate TSV with only the columns evaluation needs."""
     from .data_loader import iter_tsv
@@ -456,6 +533,10 @@ def format_report(metrics: dict) -> str:
     add(f"  true pairs retrieved             : {fmt_int(metrics['true_pairs_retrieved'])}")
     add(f"  blocking recall (pair-level)     : {100 * metrics['blocking_recall_pair']:.2f}%")
     add(
+        f"  macro recall (entity-level)      : {100 * metrics['macro_recall_entity']:.2f}%"
+        f"   -> F0.5 ceiling {metrics['f05_ceiling_from_macro_recall']:.4f} at perfect precision"
+    )
+    add(
         f"  S1 entities with ALL matches     : {100 * metrics['s1_full_recall_rate']:.2f}%"
         f"  ({fmt_int(round(metrics['s1_full_recall_rate'] * metrics['n_s1_with_true_matches']))}"
         f" of {fmt_int(metrics['n_s1_with_true_matches'])})"
@@ -490,7 +571,8 @@ def format_report(metrics: dict) -> str:
         add(
             f"  {prefix}: true={fmt_int(stats['n_true_pairs'])} "
             f"candidates={fmt_int(stats['n_candidates'])} "
-            f"recall={100 * stats['blocking_recall_pair']:.2f}%"
+            f"recall={100 * stats['blocking_recall_pair']:.2f}% "
+            f"macro_recall={100 * stats['macro_recall_entity']:.2f}%"
         )
     add("")
     if metrics.get("unknown_s1_in_candidates"):

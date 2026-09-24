@@ -157,8 +157,9 @@ def track(
 def set_seed(seed: int) -> None:
     """Seed python/random/numpy. Deliberately does not touch torch.
 
-    Importing torch here would slow down the CPU-only stages for no benefit.
-    Training scripts call ``torch.manual_seed`` themselves when torch is present.
+    Importing torch here would make every CPU stage pay for it, and torch is not
+    a core dependency. Accelerator-aware stages seed torch themselves via
+    ``seed_torch`` when it is actually installed.
     """
     random.seed(seed)
     np.random.seed(seed % (2**32))
@@ -166,12 +167,20 @@ def set_seed(seed: int) -> None:
 
 
 def resolve_device(preference: str = "auto") -> str:
-    """Pick a torch device string without ever requiring a GPU.
+    """Pick a torch device string. CPU-first, GPU when one is actually available.
 
-    The pipeline must run to completion on a CPU-only machine (the dev laptop has
-    no GPU). Embedding, dense retrieval and transformer stages call this and get
-    ``"cpu"`` when torch is absent or CUDA is unavailable, so nothing has to be
-    special-cased further down.
+    This project is **CPU-first with automatic GPU acceleration**, not CPU-only.
+    Accelerator-beneficial stages (embedding generation, dense retrieval, batched
+    embedding similarity, transformer / cross-encoder inference) call this and
+    transparently get the GPU when one exists, without any stage hardcoding
+    ``"cuda"``.
+
+    CPU is the default and the guaranteed fallback: torch is not a core
+    dependency, so on a machine without it - or without CUDA - this returns
+    ``"cpu"`` and every stage still runs to completion. Stages where CPU was
+    found to be genuinely faster (normalization, string similarity, index build,
+    GBDT training) do not call this at all; see the README "Compute
+    architecture" section for the per-stage split.
 
     Args:
         preference: ``"auto"`` (detect), or an explicit device such as
@@ -183,29 +192,72 @@ def resolve_device(preference: str = "auto") -> str:
     if preference and preference != "auto":
         return preference
     try:
-        import torch  # imported lazily: CPU-only stages never pay for it
+        import torch  # lazy: CPU-only runs never pay the import cost
     except ImportError:
         return "cpu"
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def describe_device(logger: Optional[logging.Logger] = None) -> dict:
-    """Report the compute environment. Logged at the start of GPU-capable stages."""
-    info: dict = {"device": resolve_device(), "torch": None, "gpu": None, "gpu_memory": None}
+def resolve_device_from_config(config: Optional[dict] = None) -> str:
+    """Device for an accelerator-capable stage, from ``compute.device`` in config.
+
+    The single place accelerator stages should get a device from, so a site can
+    pin ``compute.device: cpu`` (or ``cuda:1``, or ``mps``) in config.yaml -
+    including via a site-local override file - without any stage hardcoding a
+    device string.
+
+    Args:
+        config: loaded config. Missing ``compute`` block means ``"auto"``.
+
+    Returns:
+        A device string, as :func:`resolve_device`.
+    """
+    section = (config or {}).get("compute", {}) or {}
+    return resolve_device(str(section.get("device", "auto")))
+
+
+def seed_torch(seed: int) -> bool:
+    """Seed torch if it is installed. Returns whether it was.
+
+    Kept separate from :func:`set_seed` so CPU-only environments never import
+    torch, while accelerator stages still get reproducible runs.
+    """
+    try:
+        import torch
+    except ImportError:
+        return False
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return True
+
+
+def describe_device(logger: Optional[logging.Logger] = None, config: Optional[dict] = None) -> dict:
+    """Report the compute environment. Logged at the start of accelerator stages.
+
+    Args:
+        logger: optional logger.
+        config: optional loaded config; when given, the reported device honours
+            ``compute.device`` instead of always auto-detecting.
+    """
+    device = resolve_device_from_config(config) if config is not None else resolve_device()
+    info: dict = {"device": device, "torch": None, "gpu": None, "gpu_memory": None, "cuda_available": False}
     try:
         import torch
 
         info["torch"] = torch.__version__
-        if torch.cuda.is_available():
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if info["cuda_available"]:
             info["gpu"] = torch.cuda.get_device_name(0)
             info["gpu_memory"] = human_bytes(torch.cuda.get_device_properties(0).total_memory)
     except ImportError:
         pass
     if logger:
         logger.info(
-            "compute: device=%s torch=%s gpu=%s%s",
+            "compute: device=%s torch=%s cuda=%s gpu=%s%s",
             info["device"],
             info["torch"] or "not installed",
+            "yes" if info["cuda_available"] else "no",
             info["gpu"] or "none",
             f" ({info['gpu_memory']})" if info["gpu_memory"] else "",
         )

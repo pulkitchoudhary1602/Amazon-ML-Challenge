@@ -72,7 +72,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("=" * 78)
     log.info("predict: not implemented in this milestone")
     log.info(describe_environment(config))
-    describe_device(log)
+    describe_device(log, config)
     log.info("=" * 78)
     log.error("%s", NOT_IMPLEMENTED_MESSAGE)
     return 3

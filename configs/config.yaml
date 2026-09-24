@@ -63,6 +63,44 @@ io:
   # null | "gzip" | "bz2" | "zip"
   compression: null
 
+# =============================================================================
+# Compute policy
+# =============================================================================
+# The architecture is CPU-FIRST WITH AUTOMATIC GPU ACCELERATION - not CPU-only
+# and not GPU-required. Every stage runs to completion on CPU; the stages that
+# genuinely benefit from an accelerator resolve a device through
+# src/utils.resolve_device_from_config() and take the GPU when one is present.
+#
+# Stages that consult this: embedding generation, dense retrieval / FAISS,
+# batched embedding similarity, transformer / cross-encoder inference.
+# Stages that deliberately do NOT (CPU was found faster): normalization, exact
+# index build/lookup, candidate union, lexical string similarity, GBDT training.
+# See README "Compute architecture" for the per-stage rationale.
+# =============================================================================
+compute:
+  # auto   -> CUDA when torch is installed and a GPU is visible, else CPU
+  # cpu    -> pin to CPU (GPU-less node, or reproducible benchmarking)
+  # cuda   -> pin to the first GPU; fails loudly if none is visible
+  # cuda:N -> pin to a specific GPU;  mps -> Apple silicon
+  device: "auto"
+
+  # Worker processes for the CPU-bound, shardable stages (prepare_data, feature
+  # generation). 0 = auto (min(cpu_count, 8)). Used by the parallelism work.
+  num_workers: 0
+
+  # ---- Consumed by the embedding / reranking stages when implemented ----
+  # Left here as the intended knobs so those stages need no new config keys.
+  # Batch size for GPU encoding and cross-encoder reranking; tune to fit VRAM.
+  gpu_batch_size: 256
+  # float16 halves VRAM and speeds up encoding for a negligible effect on
+  # cosine ranking; float32 when exactness matters more than memory.
+  embedding_dtype: "float16"
+
+  # Shards for job-array execution of the candidate / inference stages.
+  # 1 = single process. The candidate union is per-S1, so shards are independent
+  # and merge by concatenation.
+  shard_count: 1
+
 normalization:
   # NFC | NFKC. NFKC folds compatibility forms (full-width, ligatures) which
   # helps matching; it preserves Indic scripts and their combining marks.

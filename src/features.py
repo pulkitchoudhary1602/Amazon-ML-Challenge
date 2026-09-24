@@ -35,12 +35,20 @@ Address (CPU):
 
 Categorical: source (S2/S3), country match, agreement across blockers.
 
-Semantic (GPU when available - ``utils.resolve_device()``):
+Semantic (GPU when available - resolve the device with
+``utils.resolve_device_from_config(config)``; never hardcode "cuda"):
     * cosine similarity of multilingual sentence embeddings for the name field.
       The corpus is mixed English/Devanagari/Kannada, so a multilingual encoder
       is required; embeddings are computed once per record and cached, not per
       pair, otherwise the cost is candidate-volume x encode-cost.
-    * Optional cross-encoder score on the top-N candidates only.
+      Encoding is the clearest GPU win in the project: ~12.6M texts, one-time,
+      embarrassingly parallel. Batch by ``compute.gpu_batch_size`` and store at
+      ``compute.embedding_dtype`` (float16 roughly halves storage for a
+      negligible effect on cosine ranking). A CPU path must exist and produce
+      equivalent output - slower, not different.
+    * Optional cross-encoder score on the top-N candidates only. This is the one
+      stage where a GPU is close to mandatory in practice, but it runs on a small
+      "uncertain" candidate band, so its cost stays bounded.
 
 Provenance: the ``blockers`` column survives the union in ``blocking.py`` so
 "which blocker produced this pair" is available as a feature and as an audit
@@ -54,6 +62,9 @@ Constraints to respect when implementing
   parameter-count constraints; record the chosen encoder and its size here.
 * Keep the feature computation deterministic and chunk-local so HPC jobs can be
   resumed.
+* Every accelerator-dependent feature must degrade to CPU. When torch or CUDA is
+  absent, ``resolve_device_from_config`` returns ``"cpu"`` and the feature is
+  either computed on CPU or skipped - never a hard failure.
 """
 
 from __future__ import annotations

@@ -352,6 +352,18 @@ class ExactNameIndex:
         rep_starts = row_offsets_full[representative_rows]
         rep_ends = row_offsets_full[representative_rows + 1]
 
+        # Concatenate one representative key per group.
+        #
+        # This looks like the obvious place for a vectorized gather, and it was
+        # implemented and measured as one: a single np.repeat/arange gather over
+        # the whole blob. It came out 2.2x SLOWER than this loop (507ms vs 228ms
+        # for 1M keys / 27MB). The reason is the index arithmetic: gathering
+        # variable-length slices needs one int64 index per output BYTE, so 27MB of
+        # keys costs ~650MB of temporaries across index_a/index_b/within. Keys are
+        # ~27 bytes, far too short for the per-byte index to amortize. Blocking
+        # the gather to bound memory does not help, it just re-pays the setup.
+        # A leaner loop (zip over .tolist()) was ~1.1x faster but materializes two
+        # 4M-element python int lists (~220MB at S2 scale) - not worth it.
         unique_blob = bytearray()
         unique_offsets = np.empty(len(representative_rows) + 1, dtype=np.int64)
         cursor = 0
@@ -482,6 +494,18 @@ class ExactNameIndex:
 
         Decodes each distinct position once, so the common case (many S1 sharing
         a key) costs a handful of decodes rather than one per query.
+
+        WHY THIS IS NOT VECTORIZED. It was rewritten to compare UTF-8 byte slices
+        straight out of the blob (one flat uint8 view, np.repeat/arange index
+        arithmetic, reduceat over the mismatches) and measured against this
+        version: 277ms vs 113ms for 300k queries over 180k keys, i.e. 2.5x
+        SLOWER. Keys average ~20 bytes, so a per-byte comparison needs ~8 bytes of
+        int64 index per compared byte - three index arrays plus the mismatch
+        vector cost far more to build than the 300k short-string comparisons they
+        replace. An intermediate variant that kept ``str`` comparison but let
+        numpy do it in C via a ``<U`` array was also slower (153ms).
+        ``str.__eq__`` on short strings is already near-optimal; leaving this
+        alone is the measured-best choice, not an oversight.
         """
         valid = positions >= 0
         if not valid.any():

@@ -27,10 +27,12 @@ Recommended progression (measure at each step, do not skip ahead):
 
 1. **Threshold on a lexical score** - a single feature (e.g. token-set ratio)
    with a threshold tuned on the val split. Gives a real F0.5 number and a floor
-   to beat. Cheap, CPU-only, interpretable.
-2. **Gradient-boosted trees** on the lexical + address features. Still CPU-only;
-   this is expected to be the bulk of the score. Handle missing addresses
-   natively.
+   to beat. Deliberately CPU: thresholding one score on a few million pairs
+   needs no accelerator, and adding one would only add a transfer cost.
+2. **Gradient-boosted trees** on the lexical + address features. CPU by default
+   - for ~20 features the GPU histogram path often loses to a well-threaded CPU
+   build - so benchmark ``device=cuda`` on a real sample before switching. This
+   is expected to be the bulk of the score. Handle missing addresses natively.
 3. **Add semantic features** from multilingual embeddings, GPU when available.
 4. **Re-ranking with a cross-encoder** on the top candidates only, if it still
    pays for itself after step 3.
@@ -46,7 +48,10 @@ blocking report after every blocker change.
 
 Constraints
 -----------
-* CPU must remain sufficient for the whole pipeline; GPU is an optimization.
+* CPU must remain sufficient for the whole pipeline. A GPU is an accelerator for
+  specific stages, never a requirement: resolve it with
+  ``utils.resolve_device_from_config(config)`` rather than hardcoding a device
+  string. See README "Compute architecture" for which stages benefit.
 * Model license and parameter-count constraints apply to whatever is finally
   submitted - record them here before shipping.
 * No external data or internet augmentation.
@@ -58,7 +63,7 @@ from typing import Any
 
 NOT_IMPLEMENTED_MESSAGE = (
     "src/matching_model.py is a milestone-2 stub: no match classifier is implemented yet.\n"
-    "Suggested first step (cheap, CPU-only, gives a real F0.5 baseline): threshold the\n"
+    "Suggested first step (cheap, CPU is the right tool here, gives a real F0.5 baseline): threshold the\n"
     "token-set ratio feature on the validation split."
 )
 

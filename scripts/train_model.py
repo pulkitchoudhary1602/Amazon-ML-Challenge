@@ -13,8 +13,9 @@ What is in place for this stage:
 * a validation split defined by S1 entity, so train/val never share an entity
 * ``src/evaluation.py`` with the per-entity macro F0.5 implementation, so any
   trained model can be scored the way the challenge scores it
-* ``src/utils.resolve_device()``, which returns ``"cpu"`` on this machine and
-  ``"cuda"`` automatically on an HPC node with a GPU
+* ``src/utils.resolve_device_from_config(config)``, so this stage picks up a GPU
+  automatically on a node that has one and falls back to CPU everywhere else -
+  never a hardcoded device string
 
 Recommended order once the blockers are strong enough:
 
@@ -58,7 +59,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("=" * 78)
     log.info("train_model: not implemented in this milestone")
     log.info(describe_environment(config))
-    describe_device(log)
+    describe_device(log, config)
     log.info("=" * 78)
     log.error("%s", NOT_IMPLEMENTED_MESSAGE)
     return 3

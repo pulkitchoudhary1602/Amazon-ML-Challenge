@@ -9,8 +9,11 @@ Pipeline stages, each runnable from the command line:
     scripts/predict.py             candidates + model -> matching_results.tsv
 
 Heavy stages are chunked and streamed so peak memory is governed by
-``io.chunksize`` rather than by dataset size. Nothing requires a GPU; CUDA is
-detected and used opportunistically by the embedding/transformer stages.
+``io.chunksize`` rather than by dataset size. The architecture is CPU-first:
+every stage runs without a GPU, and the accelerator-beneficial ones (embedding
+generation, dense retrieval, batched embedding similarity, transformer
+re-ranking) resolve a device through ``utils.resolve_device`` rather than
+hardcoding one. See README "Compute architecture".
 
 Submodules are deliberately NOT imported here: ``import src`` stays cheap and
 free of pandas/torch, so CLI scripts and tests only pay for what they use.
