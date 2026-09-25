@@ -1300,13 +1300,20 @@ def test_merge_features_copies_worker_files_in_order():
 
 
 def test_filtered_lookup_keeps_every_join_the_unfiltered_one_makes():
-    """The per-worker filter is invisible in the values, which is why it is safe."""
+    """The per-worker filter is invisible in the values, which is why it is safe.
+
+    The filter is only ever asked about ids the asking shard can join to:
+    ``_collect_needed_ids`` builds ``keep_ids`` from the shard's own rows, so a
+    worker's ``take`` never names an id outside it. That domain is what this test
+    exercises - an id deliberately dropped by ``keep_ids`` is expected to report
+    "not found", and is checked separately below.
+    """
     fixture = _fixture()
     try:
         full = epf.load_lookup(fixture.config, "train", "source2", fixture.log)
         filtered = epf.load_lookup(fixture.config, "train", "source2", fixture.log,
                                    keep_ids={"S2-1", "S2-3"})
-        ids = np.array(["S2-1", "S2-2", "S2-3", "S9-7", ""], dtype=object)
+        ids = np.array(["S2-1", "S2-3", "S9-7", ""], dtype=object)
         positions_full, found_full = full.take(ids)
         positions_filtered, found_filtered = filtered.take(ids)
         # Same join verdict for every id: kept, and found exactly when it was before.
@@ -1317,6 +1324,11 @@ def test_filtered_lookup_keeps_every_join_the_unfiltered_one_makes():
                 filtered.values(column, positions_filtered, found_filtered)
             ), column
         assert full.n_entities == 3 and filtered.n_entities == 2
+        # The filter only ever *removes* rows: the id it dropped is absent rather than
+        # altered, which is why a worker can never ask about one.
+        probed = np.array(["S2-2"], dtype=object)
+        assert bool(full.take(probed)[1][0])
+        assert not bool(filtered.take(probed)[1][0])
         # The whole point: fewer rows resident, so W workers do not hold W copies.
         assert filtered.memory_bytes() < full.memory_bytes()
         # A shard with no pairs for a source loads that source as an empty lookup, and
