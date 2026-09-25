@@ -412,24 +412,79 @@ python scripts/extract_pair_features.py \
   input path; the split comes from `assign_splits`, the same pure function
   `src/evaluation.py` uses.
 
+#### Parallel feature extraction (`--workers N`)
+
+Phase 1 (scan and sample) stays in the parent whatever `--workers` is, so the
+selected entities - and therefore the whole-entity sampling invariant - cannot
+depend on the worker count. Only phase 2 is parallelized:
+
+```bash
+# same sample, featurized by 8 processes (10-CPU allocation)
+python scripts/extract_pair_features.py \
+    --config configs/config.yaml --split train \
+    --sample-fraction 0.03 --workers 8 \
+    --output-dir outputs/experiments/step3_features_w8
+```
+
+* `--workers 1` is the default and is the **original single-process path,
+  unchanged** - same code path, no shard files, no worker processes.
+* The parent partitions the *selected S1 entities* into N contiguous, row-balanced
+  groups. Row balance, not entity-count balance: entities differ by an order of
+  magnitude in candidate count, so splitting the entity list evenly would leave one
+  worker with most of the work. Entity → worker is a pure function of the entity's
+  position in the scan and its row count, so the partition is reproducible.
+* Each worker loads **only the text its own shard can join to** (its S1 ids plus the
+  target ids its rows reference). A filter cannot change a join result - an id is
+  kept when it is needed *and* present, and an id absent from the prepared file is a
+  join failure with or without the filter - so W workers hold roughly one copy of the
+  prepared text between them rather than W copies. The report's
+  `parallel.total_lookup_size` is what the node needs at that worker count; compare
+  it with `memory.prepared_lookup_estimate` from a `--workers 1` run of the same
+  command.
+* The merge is in **worker index order, never completion order**, so two runs of the
+  same command produce the same bytes whatever order the workers finish in.
+  `--workers 2` output is byte-identical to `--workers 1` on the same sample (asserted
+  on a synthetic fixture).
+* `--workers` is validated against the CPUs this process may actually use (the
+  affinity mask, i.e. the scheduler allocation - not the node's core count), and a
+  count outside `1..that` is rejected rather than clamped. Nothing hardcodes 48.
+* Workers run under `spawn` on every platform: `fork` would inherit the parent's
+  pages, which buys nothing here (the parent holds no prepared text) and would
+  contaminate the per-worker RSS figures this experiment exists to report.
+* Worker shards, per-worker logs and per-worker feature files land in
+  `<output-dir>/workers/` - never in the repository root - and are **kept** after a
+  successful run, because they are what makes a worker disagreement traceable.
+  `--cleanup-shards` removes that directory once the merge has succeeded.
+* The end of the log reports workers, selected S1 entities, candidate pairs
+  processed, feature rows, elapsed time, peak RSS and throughput, plus per-worker
+  rows/seconds/lookup size and the node total. The 48-worker projection is reported
+  only in a block explicitly labelled **theoretical/unmeasured**; the measured
+  projection is labelled with the worker count it was actually measured at.
+
 Outputs, all inside one experiment directory: `sample_candidates.tsv`,
-`features.tsv`, `feature_missingness.csv`, `step3_features_report.json` and
-`extract_pair_features.log`. The report carries the sample size, scan and feature
-throughput, peak RSS, per-feature dtype/min/max/missingness, join and duplicate
-counters, output sizes, and a full-scale extrapolation **labelled with a
-confidence level** - the projections assume the feature kernel scales
-near-linearly with workers and that the sample's names are as long as the real
-ones, and both assumptions are stated in the report rather than implied.
+`features.tsv`, `feature_missingness.csv`, `step3_features_report.json`,
+`extract_pair_features.log`, and - for `--workers N > 1` - `workers/`. The report
+carries the sample size, scan/shard/merge/feature throughput, peak RSS (per process
+and the node total, when parallel), per-feature dtype/min/max/missingness, join and
+duplicate counters, output sizes, and a full-scale extrapolation **labelled with a
+confidence level** - the projections assume the feature kernel scales near-linearly
+with workers and that the sample's names are as long as the real ones, and both
+assumptions are stated in the report rather than implied.
 
 `rapidfuzz` is required for the three ratio features; without it they degrade to
 NaN and `integrity.rapidfuzz_available` records the fact instead of the run
 failing silently.
 
-Validated locally by `tests/test_pair_features.py` (**37/37**, synthetic fixtures
+Validated locally by `tests/test_pair_features.py` (**51/51**, synthetic fixtures
 only), which pins the hand-computed value of every similarity, both blank-evidence
 rules, the whole-entity sampling invariant (including across a chunk boundary),
-duplicate counting, and byte-identical output across chunk sizes. The full 336M-pair
-run has **not** been executed anywhere yet.
+duplicate counting, byte-identical output across chunk sizes, and the parallel layer:
+the sample is identical at `--workers 1` and `--workers 2`, the partition is
+complete/disjoint/deterministic/row-balanced, worker output carries the
+single-process schema, the merged `--workers 2` output equals `--workers 1` row for
+row, empty partitions and invalid worker counts are handled, and `--workers 1`
+creates no worker directory at all. The full 336M-pair run has **not** been executed
+anywhere yet.
 
 ### HPC notes
 

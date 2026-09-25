@@ -24,6 +24,13 @@ There is no ground-truth file anywhere in this fixture, deliberately: the split
 comes from ``assign_splits``, the same pure function ``src/evaluation.py`` uses,
 so nothing here can leak a label into a feature.
 
+The last group of tests covers ``--workers``: the parallel layer may change *where*
+a row is featurized, never *which* rows are selected or *what* is computed. The
+sample is chosen once in the parent, before any worker exists, so a worker count
+cannot move it; the partition is complete, disjoint and deterministic; and the
+merge runs in worker order, so the output does not depend on which worker finished
+first. ``--workers 1`` is held to the original single-process path, unchanged.
+
 The fixture is synthetic and self-contained. Nothing reads the dataset, and every
 file written goes into a temp directory - ``outputs/`` is never touched.
 
@@ -32,9 +39,12 @@ Runs standalone (``python tests/test_pair_features.py``) and under pytest.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import logging
+import os
 import shutil
 import sys
 import tempfile
@@ -207,19 +217,38 @@ class _Fixture:
     def config(self) -> dict:
         return epf.load_config(str(self.config_path))
 
-    def argv(self, **overrides) -> list[str]:
+    def argv(self, out_dir: Path | None = None, **overrides) -> list[str]:
+        """A command line for this fixture.
+
+        ``out_dir`` picks the output directory (defaults to the fixture's own), so
+        one fixture can run the same command twice and compare the two results -
+        which is how the ``--workers`` regression tests work. A ``True`` override
+        becomes a bare flag (for ``--cleanup-shards``), and ``False``/``None``
+        leave the flag off.
+        """
         argv = ["--config", str(self.config_path), "--split", "train",
-                "--output-dir", str(self.out)]
+                "--output-dir", str(out_dir or self.out)]
         for key, value in overrides.items():
-            argv += [f"--{key.replace('_', '-')}", str(value)]
+            flag = f"--{key.replace('_', '-')}"
+            if value is True:
+                argv.append(flag)
+            elif value is False or value is None:
+                continue
+            else:
+                argv += [flag, str(value)]
         return argv
 
     def args(self, **overrides):
         return epf.parse_args(self.argv(**overrides))
 
     def run(self, **overrides):
-        code = epf.main(self.argv(**overrides))
-        report = json.loads((self.out / "step3_features_report.json").read_text())
+        return self.run_into(self.out, **overrides)
+
+    def run_into(self, out_dir: Path, **overrides):
+        """Run the CLI into ``out_dir`` and read back its report."""
+        out_dir.mkdir(parents=True, exist_ok=True)
+        code = epf.main(self.argv(out_dir=out_dir, **overrides))
+        report = json.loads((out_dir / "step3_features_report.json").read_text())
         return code, report
 
     def features(self) -> pd.DataFrame:
@@ -240,6 +269,65 @@ class _Fixture:
 
 def _fixture() -> _Fixture:
     return _Fixture()
+
+
+SORT_KEY = (
+    epf.CANDIDATE_S1_COLUMN,
+    epf.CANDIDATE_TARGET_COLUMN,
+    epf.CANDIDATE_SOURCE_COLUMN,
+)
+
+
+def _features_at(out_dir: Path) -> pd.DataFrame:
+    return pd.read_csv(out_dir / "features.tsv", sep="\t", dtype=str)
+
+
+def _sample_at(out_dir: Path) -> pd.DataFrame:
+    return pd.read_csv(out_dir / "sample_candidates.tsv", sep="\t", dtype=str)
+
+
+def _data_lines(path: Path) -> list[str]:
+    """Every line of a TSV except the header, with the newline stripped.
+
+    Read and split with ``newline=""`` so a line is a line whatever the platform's
+    terminator is, which keeps the worker-order comparison honest.
+    """
+    with open(path, encoding="utf-8", newline="") as handle:
+        lines = handle.read().split("\n")
+    return [line.rstrip("\r") for line in lines[1:] if line.strip()]
+
+
+def _header_line(path: Path) -> str:
+    with open(path, encoding="utf-8", newline="") as handle:
+        return handle.readline().rstrip("\r\n")
+
+
+class _FakeCpuAllocation:
+    """Pretend this process was allocated ``cpus`` CPUs, for one block.
+
+    ``--workers`` is validated against the CPUs the process may actually use, so a
+    two-CPU machine would reject the four- and eight-worker cases before they ran -
+    and the tests would silently stop covering the partition at those counts. The
+    limit is therefore set explicitly here. Every test that sets it also asserts the
+    value it set is the one that was accepted, so this cannot hide a real clamp.
+    """
+
+    def __init__(self, cpus: int) -> None:
+        self.cpus = int(cpus)
+
+    def __enter__(self) -> _FakeCpuAllocation:
+        self._real = epf.available_cpu_count
+        epf.available_cpu_count = lambda: self.cpus
+        return self
+
+    def __exit__(self, *exc_info) -> bool:
+        epf.available_cpu_count = self._real
+        return False
+
+
+def _counts(n_entities: int, seed: int = 7) -> dict[str, int]:
+    """A deliberately skewed per-entity candidate count, like the real file's."""
+    return {f"S1-{index}": 1 + (index * seed) % 23 for index in range(n_entities)}
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +960,438 @@ def test_output_directory_defaults_outside_the_candidate_directory():
         default = candidate_dir.parent / "experiments" / "step3_features"
         assert candidate_dir not in default.parents
         assert default != candidate_dir
+    finally:
+        fixture.close()
+
+
+# ---------------------------------------------------------------------------
+# --workers: one computation, two execution layers
+# ---------------------------------------------------------------------------
+# Phase 1 (scan and sample) stays in the parent whatever --workers is, so the
+# selection cannot depend on the worker count. Phase 2 is partitioned by whole S1
+# entity into contiguous row-balanced shards, each worker loads only the prepared
+# text its own shard can join to, and the merge concatenates the worker files in
+# worker order. These tests hold the parallel path to that design.
+def test_workers1_selects_the_same_s1_entities():
+    """The sample is a function of the corpus alone - never of the worker count."""
+    fixture = _fixture()
+    try:
+        one_dir, two_dir = fixture.root / "out_w1", fixture.root / "out_w2"
+        with _FakeCpuAllocation(4):
+            code_one, one = fixture.run_into(one_dir, sample_fraction=1.0, workers=1)
+            code_two, two = fixture.run_into(two_dir, sample_fraction=1.0, workers=2)
+        assert code_one == 0 and code_two == 0
+
+        # Phase 1 writes the sample before a worker exists, so the two runs produce
+        # byte-identical sample files - not merely the same set of entities.
+        assert (two_dir / "sample_candidates.tsv").read_bytes() == (
+            one_dir / "sample_candidates.tsv"
+        ).read_bytes()
+        assert two["sample"] == one["sample"]
+        assert one["inputs"]["workers"] == 1 and two["inputs"]["workers"] == 2
+
+        # And it is still exactly the validation entities: the sampling rule this
+        # experiment shipped with, untouched by the parallel layer.
+        sample = _sample_at(two_dir)
+        assert set(sample[epf.CANDIDATE_S1_COLUMN]) == _val_ids()
+        counts = sample[epf.CANDIDATE_S1_COLUMN].value_counts().to_dict()
+        assert len(counts) == two["sample"]["n_s1_entities_sampled"] == len(_val_ids())
+    finally:
+        fixture.close()
+
+
+def test_partition_has_no_duplicate_entities():
+    """No S1 entity is handled twice, at any worker count - whole entities once."""
+    counts = _counts(37)
+    for workers in (1, 2, 4, 8, 10):
+        groups = epf.partition_entities(counts, workers)
+        assert len(groups) == workers
+        flat = [entity for group in groups for entity in group]
+        assert len(flat) == len(set(flat)), f"an entity went to two workers at {workers}"
+        assert len(flat) == len(counts)
+        assert set(flat) == set(counts)
+
+
+def test_workers2_covers_exactly_the_workers1_entities():
+    """The union of the workers is the whole selection, and nothing else."""
+    counts = _counts(37)
+    one = epf.partition_entities(counts, 1)
+    two = epf.partition_entities(counts, 2)
+    # workers=1 is the identity partition, in file order.
+    assert one == [list(counts)]
+    assert set(two[0]) | set(two[1]) == set(counts)
+    assert not (set(two[0]) & set(two[1]))
+
+    fixture = _fixture()
+    try:
+        one_dir, two_dir = fixture.root / "out_w1", fixture.root / "out_w2"
+        with _FakeCpuAllocation(4):
+            _, one_report = fixture.run_into(one_dir, sample_fraction=1.0, workers=1)
+            _, two_report = fixture.run_into(two_dir, sample_fraction=1.0, workers=2)
+        first = _features_at(one_dir)
+        second = _features_at(two_dir)
+        assert set(second[epf.CANDIDATE_S1_COLUMN]) == set(first[epf.CANDIDATE_S1_COLUMN])
+        assert len(set(second[epf.CANDIDATE_S1_COLUMN])) == (
+            one_report["sample"]["n_s1_entities_sampled"]
+        )
+        # Every entity's pairs are featurized too, not just the entity id written out.
+        assert len(second) == len(first) == one_report["sample"]["n_candidate_pairs_sampled"]
+        assert two_report["sample"]["n_candidate_pairs_sampled"] == (
+            one_report["sample"]["n_candidate_pairs_sampled"]
+        )
+        # Each worker's own entity count is reported, and they sum to the selection.
+        assert sum(two_report["parallel"]["n_s1_entities_per_worker"]) == (
+            one_report["sample"]["n_s1_entities_sampled"]
+        )
+    finally:
+        fixture.close()
+
+
+def test_worker_outputs_share_the_single_process_schema():
+    """A worker writes the same columns in the same order as the single process."""
+    fixture = _fixture()
+    try:
+        one_dir, two_dir = fixture.root / "out_w1", fixture.root / "out_w2"
+        with _FakeCpuAllocation(2):
+            _, one = fixture.run_into(one_dir, sample_fraction=1.0, workers=1)
+            code, two = fixture.run_into(two_dir, sample_fraction=1.0, workers=2)
+        assert code == 0, two["integrity"]
+
+        expected = [epf.CANDIDATE_S1_COLUMN, epf.CANDIDATE_TARGET_COLUMN,
+                    epf.CANDIDATE_SOURCE_COLUMN, *epf.FEATURE_DTYPES]
+        header = _header_line(two_dir / "features.tsv")
+        assert header.split("\t") == expected
+        assert header == _header_line(one_dir / "features.tsv")
+
+        # Every worker's own file carries that header, so the merge only ever strips
+        # a duplicate of a known header rather than inventing one.
+        worker_dir = Path(two["parallel"]["shard_dir"])
+        assert worker_dir.name == epf.WORKER_DIR_NAME
+        assert worker_dir.parent.resolve() == two_dir.resolve(), "shards must stay in --output-dir"
+        worker_files = sorted(worker_dir.glob("worker_*_features.tsv"))
+        assert len(worker_files) >= 2
+        for path in worker_files:
+            assert _header_line(path) == header, path.name
+
+        # Dtypes and the whole numeric summary are declared the same in both paths,
+        # and no worker disagreed with the declaration.
+        assert two["features"]["dtypes"] == one["features"]["dtypes"]
+        assert two["features"]["n_features"] == one["features"]["n_features"]
+        assert not two["integrity"].get("dtype_mismatches", 0)
+    finally:
+        fixture.close()
+
+
+def test_merged_workers2_equals_workers1():
+    """The strongest requirement: same rows, same values, whatever finished first."""
+    fixture = _fixture()
+    try:
+        one_dir, two_dir = fixture.root / "out_w1", fixture.root / "out_w2"
+        with _FakeCpuAllocation(2):
+            code_one, one = fixture.run_into(one_dir, sample_fraction=1.0, workers=1)
+            code_two, two = fixture.run_into(two_dir, sample_fraction=1.0, workers=2)
+        assert code_one == 0 and code_two == 0, two["integrity"]
+
+        lines_one = _data_lines(one_dir / "features.tsv")
+        lines_two = _data_lines(two_dir / "features.tsv")
+        assert len(lines_one) == len(lines_two) == two["sample"]["n_candidate_pairs_sampled"]
+        # Same multiset of rows: nothing added, dropped, duplicated or altered.
+        assert sorted(lines_two) == sorted(lines_one)
+        # Same order too - the partition is contiguous in file order and the merge is
+        # in worker order, so this holds without ever sorting. Comparing after a sort
+        # (below) would pass even if the ordering rule were broken; this does not.
+        assert lines_two == lines_one
+
+        # And the numeric summary over the merged matrix is identical, sorted on the
+        # deterministic key, which is what a trainer reads.
+        first = _features_at(one_dir).sort_values(list(SORT_KEY), kind="stable")
+        second = _features_at(two_dir).sort_values(list(SORT_KEY), kind="stable")
+        assert first.reset_index(drop=True).equals(second.reset_index(drop=True))
+        assert two["features"] == one["features"]
+        assert two["integrity"] == one["integrity"]
+    finally:
+        fixture.close()
+
+
+def test_empty_partitions_are_handled():
+    """More workers than entities: the extra workers get nothing and must not fail."""
+    counts = _counts(5)
+    groups = epf.partition_entities(counts, 9)
+    assert sum(len(group) for group in groups) == len(counts)
+    assert sum(1 for group in groups if not group) >= 4
+
+    fixture = _fixture()
+    try:
+        _, baseline = fixture.run(sample_fraction=1.0)
+        n_entities = baseline["sample"]["n_s1_entities_sampled"]
+        assert n_entities >= 2
+        # A worker's share is a contiguous run of whole entities, so k entities can
+        # fill at most k workers - four more workers than entities guarantees empties.
+        workers = n_entities + 4
+        out = fixture.root / "out_empty"
+        with _FakeCpuAllocation(workers):
+            code, report = fixture.run_into(out, sample_fraction=1.0, workers=workers)
+        assert code == 0, report["integrity"]
+
+        block = report["parallel"]
+        assert len(block["n_s1_entities_per_worker"]) == workers
+        assert sum(block["n_s1_entities_per_worker"]) == n_entities
+        assert block["n_s1_entities_per_worker"].count(0) >= 4
+        empty = [index for index, value in enumerate(block["n_s1_entities_per_worker"]) if not value]
+        assert empty
+        for index in empty:
+            assert block["rows_per_worker"][index] == 0
+            assert block["feature_seconds_per_worker"][index] == 0.0
+            # No shard is written for an empty partition, and no feature file either -
+            # the merge skips both rather than failing on a missing path.
+            worker_dir = Path(block["shard_dir"])
+            assert not (worker_dir / f"shard_{index:02d}.tsv").exists()
+            assert not (worker_dir / f"worker_{index:02d}_features.tsv").exists()
+            # The decision is still logged, so an empty worker is visible in the run.
+            assert (worker_dir / f"{epf.LOG_NAME}_w{index:02d}.log").is_file()
+
+        # The merged output is still exactly the single-process rows.
+        assert _data_lines(out / "features.tsv") == _data_lines(fixture.out / "features.tsv")
+        assert sum(block["rows_per_worker"]) == baseline["sample"]["n_candidate_pairs_sampled"]
+        assert sum(block["shard_rows_per_worker"]) == baseline["sample"]["n_candidate_pairs_sampled"]
+    finally:
+        fixture.close()
+
+
+def test_workers1_remains_the_single_process_path():
+    """--workers 1 must be the original code path, not the parallel one with N=1."""
+    fixture = _fixture()
+    try:
+        assert epf.DEFAULT_WORKERS == 1
+        assert epf.parse_args(["--config", str(fixture.config_path)]).workers == 1
+        code, report = fixture.run(sample_fraction=1.0)
+        assert code == 0
+        assert report["inputs"]["workers"] == 1
+        # The parallel report block is absent, the phases that only the parallel path
+        # has cost nothing, and nothing was partitioned onto disk.
+        assert "parallel" not in report
+        assert report["timing"]["shard_seconds"] == 0.0
+        assert report["timing"]["merge_seconds"] == 0.0
+        assert not (fixture.out / epf.WORKER_DIR_NAME).exists()
+        assert (fixture.out / "features.tsv").is_file()
+        # One process: the single-process figure is measured, not extrapolated, and
+        # the 48-worker projection is still labelled unmeasured.
+        assert report["extrapolation"]["assumed_workers"] == 1
+        assert report["extrapolation"]["workers_are_measured"] is True
+        assert report["extrapolation"]["single_process_equivalent"]["is_extrapolated"] is False
+        assert report["extrapolation"]["theoretical_48_workers"]["is_theoretical"] is True
+        assert "UNMEASURED" in report["extrapolation"]["theoretical_48_workers"]["note"]
+    finally:
+        fixture.close()
+
+
+def test_invalid_worker_counts_are_rejected():
+    """Rejected cleanly, against this process's allocation - never a clamp, never 48."""
+    fixture = _fixture()
+    try:
+        with _FakeCpuAllocation(4):
+            for bad in ("0", "-1", "5", "48", "many"):
+                try:
+                    with contextlib.redirect_stderr(io.StringIO()):
+                        epf.parse_args(["--config", str(fixture.config_path), "--workers", bad])
+                except SystemExit as exc:
+                    assert exc.code == 2, (bad, exc.code)
+                else:
+                    raise AssertionError(f"--workers {bad} must be rejected on a 4-CPU allocation")
+            # The boundary is allowed, and the accepted count is the one used.
+            assert epf.parse_args(["--config", str(fixture.config_path),
+                                   "--workers", "4"]).workers == 4
+            assert epf.available_cpu_count() == 4
+
+            # The message names the allocation, so a rejected job says why.
+            message = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(message):
+                    epf.parse_args(["--config", str(fixture.config_path), "--workers", "5"])
+            except SystemExit:
+                pass
+            assert "5" in message.getvalue() and "4 CPU" in message.getvalue()
+            assert "48" not in message.getvalue()
+
+        # And the real limit is the allocation this process actually has.
+        assert epf.available_cpu_count() >= 1
+    finally:
+        fixture.close()
+
+
+def test_the_worker_limit_is_the_process_allocation():
+    """On a scheduler-allocated node the limit is the affinity mask, not the machine."""
+    if not hasattr(os, "sched_getaffinity"):  # pragma: no cover - Windows
+        assert epf.available_cpu_count() == max(1, os.cpu_count() or 1)
+        return
+    assert epf.available_cpu_count() == max(1, len(os.sched_getaffinity(0)))
+
+
+def test_partition_entities_is_contiguous_and_row_balanced():
+    """The four properties the merge's determinism and the load balance rest on."""
+    counts = _counts(37)
+    workers = 7
+    groups = epf.partition_entities(counts, workers)
+    positions = {entity: index for index, entity in enumerate(counts)}
+    flat = [entity for group in groups for entity in group]
+
+    # Complete and disjoint, and each worker's entities are one contiguous run of the
+    # file order, ascending - which is what makes the merge a plain concatenation.
+    assert set(flat) == set(counts) and len(flat) == len(counts)
+    blocks = []
+    for group in groups:
+        where = [positions[entity] for entity in group]
+        assert where == sorted(where)
+        blocks.append(where)
+    occupied = sorted(index for where in blocks for index in where)
+    assert occupied == list(range(len(counts)))
+
+    # Balanced by rows, not by entity count: entities differ by an order of magnitude
+    # in candidate count, so an even split of the entity list would not be an even
+    # split of the work. A worker's window is one band of the row range, and it can
+    # only overrun it by the entities that straddle its ends.
+    total = sum(counts.values())
+    largest = max(counts.values())
+    rows_per_worker = [sum(counts[entity] for entity in group) for group in groups]
+    assert max(rows_per_worker) <= total / workers + largest
+
+    # Reproducible, and independent of dict order in any way that matters: the same
+    # counts give the same partition, every time.
+    assert epf.partition_entities(counts, workers) == groups
+    assert epf.partition_entities(dict(counts), workers) == groups
+    # Deterministic even when entities are far from uniform in size.
+    lumpy = {**counts, "S1-heavy": 5000}
+    assert epf.partition_entities(lumpy, 4) == epf.partition_entities(lumpy, 4)
+    # Degenerate inputs: one entity, no entities, more workers than entities.
+    assert epf.partition_entities({}, 4) == [[], [], [], []]
+    assert epf.partition_entities({"S1-1": 0}, 3) == [["S1-1"], [], []]
+    assert epf.partition_entities({"S1-1": 0}, 1) == [["S1-1"]]
+
+
+def test_merge_features_copies_worker_files_in_order():
+    """One header, worker order, empty and missing files skipped, bytes copied."""
+    root = Path(tempfile.mkdtemp(prefix="step3_merge_test_"))
+    try:
+        def write(name: str, text: str) -> Path:
+            path = root / name
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+            return path
+
+        header = "a\tb\n"
+        payload = "1\t2\n3\t4\n"
+        first = write("shard_00.tsv", header + "1\t2\n")
+        empty = write("shard_01.tsv", "")
+        second = write("shard_02.tsv", header + "3\t4\n")
+        missing = root / "shard_03.tsv"
+        target = root / "features.tsv"
+
+        size = epf.merge_features([first, empty, second, missing], target)
+        with open(target, encoding="utf-8", newline="") as handle:
+            assert handle.read() == header + payload
+        assert size == target.stat().st_size == len(header) + len(payload)
+        # All-empty input is not an error either: it is an empty file, byte for byte.
+        nothing = root / "empty.tsv"
+        assert epf.merge_features([empty, missing], nothing) == 0
+        with open(nothing, encoding="utf-8", newline="") as handle:
+            assert handle.read() == ""
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_filtered_lookup_keeps_every_join_the_unfiltered_one_makes():
+    """The per-worker filter is invisible in the values, which is why it is safe."""
+    fixture = _fixture()
+    try:
+        full = epf.load_lookup(fixture.config, "train", "source2", fixture.log)
+        filtered = epf.load_lookup(fixture.config, "train", "source2", fixture.log,
+                                   keep_ids={"S2-1", "S2-3"})
+        ids = np.array(["S2-1", "S2-2", "S2-3", "S9-7", ""], dtype=object)
+        positions_full, found_full = full.take(ids)
+        positions_filtered, found_filtered = filtered.take(ids)
+        # Same join verdict for every id: kept, and found exactly when it was before.
+        assert list(found_full) == list(found_filtered)
+        for column in (epf.PREPARED_NAME_NORM, epf.PREPARED_NAME_KEY,
+                       epf.PREPARED_ADDRESS_NORM, epf.PREPARED_COUNTRY_NORM):
+            assert list(full.values(column, positions_full, found_full)) == list(
+                filtered.values(column, positions_filtered, found_filtered)
+            ), column
+        assert full.n_entities == 3 and filtered.n_entities == 2
+        # The whole point: fewer rows resident, so W workers do not hold W copies.
+        assert filtered.memory_bytes() < full.memory_bytes()
+        # A shard with no pairs for a source loads that source as an empty lookup, and
+        # an empty lookup joins nothing rather than raising.
+        nothing = epf.load_lookup(fixture.config, "train", "source2", fixture.log, keep_ids=set())
+        assert nothing.n_entities == 0
+        assert not nothing.take(ids)[1].any()
+        assert nothing.memory_bytes() >= 0
+    finally:
+        fixture.close()
+
+
+def test_parallel_report_block_describes_the_run():
+    """The benchmark is read off this block, so it must be complete and consistent."""
+    fixture = _fixture()
+    try:
+        out = fixture.root / "out_w2"
+        with _FakeCpuAllocation(2):
+            code, report = fixture.run_into(out, sample_fraction=1.0, workers=2)
+        assert code == 0, report["integrity"]
+        block = report["parallel"]
+
+        assert block["workers"] == 2 == report["inputs"]["workers"]
+        assert "worker index" in block["merge_order"] and "completion" in block["merge_order"]
+        for key in ("n_s1_entities_per_worker", "rows_per_worker", "shard_rows_per_worker",
+                    "feature_seconds_per_worker", "lookup_bytes_per_worker"):
+            assert len(block[key]) == 2, key
+        assert sum(block["rows_per_worker"]) == report["sample"]["n_candidate_pairs_sampled"]
+        assert sum(block["shard_rows_per_worker"]) == report["sample"]["n_candidate_pairs_sampled"]
+        assert sum(block["n_s1_entities_per_worker"]) == report["sample"]["n_s1_entities_sampled"]
+        assert block["total_lookup_bytes"] == sum(block["lookup_bytes_per_worker"])
+        assert block["max_worker_lookup_bytes"] == max(block["lookup_bytes_per_worker"])
+        assert block["unassigned_rows"] == 0
+        assert block["s1_counts_entries"] == report["sample"]["n_s1_entities_sampled"]
+        assert 0.0 <= block["worker_utilization"] <= 1.0
+        assert block["total_peak_rss"] is None or block["total_peak_rss"]
+
+        # The three parallel phases add up to the phase total the report projects from.
+        assert abs(block["shard_seconds"] + block["worker_wall_seconds"]
+                   + block["merge_seconds"] - block["parallel_phase_seconds"]) <= 0.05
+        assert report["timing"]["parallel_phase_seconds"] == block["parallel_phase_seconds"]
+        assert report["timing"]["shard_seconds"] == block["shard_seconds"]
+        assert report["timing"]["merge_seconds"] == block["merge_seconds"]
+        assert report["memory"]["prepared_lookup_estimate"] == block["total_lookup_size"]
+
+        # The projection is labelled with the worker count it was measured at, and the
+        # 48-worker number is quarantined as an assumption rather than reported as one.
+        assert report["extrapolation"]["assumed_workers"] == 2
+        assert report["extrapolation"]["workers_are_measured"] is True
+        assert report["extrapolation"]["single_process_equivalent"]["is_extrapolated"] is True
+        assert report["extrapolation"]["parallel_phase_seconds_measured"] == (
+            block["parallel_phase_seconds"]
+        )
+    finally:
+        fixture.close()
+
+
+def test_cleanup_shards_removes_only_the_worker_directory():
+    """Shards are kept by default (they make a disagreement traceable), removable on request."""
+    fixture = _fixture()
+    try:
+        out = fixture.root / "out_clean"
+        with _FakeCpuAllocation(2):
+            code, report = fixture.run_into(out, sample_fraction=1.0, workers=2,
+                                            cleanup_shards=True)
+        assert code == 0, report["integrity"]
+        assert report["parallel"]["shard_dir"]
+        assert not (out / epf.WORKER_DIR_NAME).exists()
+        for name in ("features.tsv", "sample_candidates.tsv", "feature_missingness.csv",
+                     "step3_features_report.json", "extract_pair_features.log"):
+            assert (out / name).is_file(), name
+        # The report still says where the shards were and what they contained.
+        assert sum(report["parallel"]["shard_rows_per_worker"]) == report["sample"][
+            "n_candidate_pairs_sampled"
+        ]
     finally:
         fixture.close()
 
