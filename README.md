@@ -378,6 +378,59 @@ HPC:
 | `tests/test_compute_utils.py` | 23/23 |
 | `tests/test_recall_at_k.py` | 5/5 |
 
+### Step 3: matcher feature extraction (de-risk experiment)
+
+`scripts/extract_pair_features.py` materializes the first matcher feature set on a
+**sample of validation candidate pairs**, to size the full run before committing
+to it. It is a measurement script, not a pipeline stage: it trains nothing,
+changes no blocker, and writes only inside its own experiment directory
+(`<candidates_dir>/../experiments/step3_features`, or `--output-dir`), so nothing
+it produces can be mistaken for a pipeline artifact.
+
+```bash
+python scripts/extract_pair_features.py \
+    --config configs/config.yaml \
+    --split train \
+    --sample-fraction 0.03 \
+    --output-dir outputs/experiments/step3_features
+```
+
+* **Sampling is by whole S1 entity**, decided by a pure function of the entity id
+  (the same `assign_splits` the evaluator uses, plus an independent second bucket
+  of the same hash). Sampling whole entities is what keeps the run leak-free: a
+  matcher trained on part of an entity's candidate list is still trained on that
+  entity's name, address and competitor set.
+* **Blank evidence is not zero.** `token_df` is blank on every pair the token
+  blocker did not propose and `char_jaccard` on every pair the char blocker did
+  not propose; both become `NaN`, never `0`. Every run reports a per-feature
+  missingness rate so the blanks stay visible.
+* **A failed text join keeps its row.** One row per candidate pair is the
+  contract. When an id is missing from the prepared corpus, the text-derived
+  features are blanked and `text_join_ok` is 0, while provenance/evidence/the S1
+  candidate count - which come from the candidate file, not the join - are kept.
+* **No ground truth is read.** There is no label column and no truth file in the
+  input path; the split comes from `assign_splits`, the same pure function
+  `src/evaluation.py` uses.
+
+Outputs, all inside one experiment directory: `sample_candidates.tsv`,
+`features.tsv`, `feature_missingness.csv`, `step3_features_report.json` and
+`extract_pair_features.log`. The report carries the sample size, scan and feature
+throughput, peak RSS, per-feature dtype/min/max/missingness, join and duplicate
+counters, output sizes, and a full-scale extrapolation **labelled with a
+confidence level** - the projections assume the feature kernel scales
+near-linearly with workers and that the sample's names are as long as the real
+ones, and both assumptions are stated in the report rather than implied.
+
+`rapidfuzz` is required for the three ratio features; without it they degrade to
+NaN and `integrity.rapidfuzz_available` records the fact instead of the run
+failing silently.
+
+Validated locally by `tests/test_pair_features.py` (**37/37**, synthetic fixtures
+only), which pins the hand-computed value of every similarity, both blank-evidence
+rules, the whole-entity sampling invariant (including across a chunk boundary),
+duplicate counting, and byte-identical output across chunk sizes. The full 336M-pair
+run has **not** been executed anywhere yet.
+
 ### HPC notes
 
 * Everything is a plain CLI command - wrap it in your scheduler's batch script.

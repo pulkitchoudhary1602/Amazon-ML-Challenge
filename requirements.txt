@@ -38,7 +38,13 @@ psutil>=5.9
 # Lexical pair features (token/ratio similarity). C++ and parallelizes across
 # cores; the review found no GPU edit-distance path worth using, so this stays a
 # CPU dependency even on a GPU node.
-# rapidfuzz>=3.6
+#
+# Uncommented because scripts/extract_pair_features.py (the matcher feature
+# extractor) uses it for name_token_set_ratio / name_token_sort_ratio /
+# name_partial_ratio. Those three degrade to NaN, with the condition recorded in
+# the run's report, rather than the run failing - so the blocker and candidate
+# stages still work without it, but the matcher's feature set does not.
+rapidfuzz>=3.6
 
 # Gradient-boosted trees for the match classifier. Permissive licence (MIT).
 # CPU by default: for ~20 features the GPU histogram path often loses to a
