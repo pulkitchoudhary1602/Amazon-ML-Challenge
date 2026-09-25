@@ -1,11 +1,18 @@
 #!/usr/bin/env python
 """Stage 3: generate candidate pairs for every S1 entity.
 
-Looks up each S1's normalized name in the S2 and S3 indexes, unions the results,
+Runs the configured blockers against the S2 and S3 indexes, unions their output,
 deduplicates, and writes ``candidate_pairs.tsv`` incrementally.
 
-This is where the 22,774,876,013,799-pair cross product is avoided: only pairs
-sharing a blocking key are ever produced.
+The union is a **union**: a pair proposed by any enabled blocker is a candidate.
+Blockers never intersect, because blocking's job is to be a safe over-approximation
+- the matcher downstream can reject a false candidate, but nothing can recover a true
+pair that blocking never proposed.
+
+Each blocker queries its own key column (``name_norm`` for exact/token, ``name_key``
+for char), which is why a single shared query column is not used, and each pair
+carries the set of blockers that proposed it plus whatever per-pair evidence those
+blockers measured.
 
 Memory: O(rows per S1 chunk) - the candidate table is never held whole. Peak is
 roughly ``chunk_s1 * avg_candidates * (8 bytes packed + ~60 bytes decoded)``.
@@ -13,12 +20,17 @@ roughly ``chunk_s1 * avg_candidates * (8 bytes packed + ~60 bytes decoded)``.
     python scripts/generate_candidates.py
     python scripts/generate_candidates.py --limit-s1 100000            # smoke test
     python scripts/generate_candidates.py --max-candidates 50          # cap per S1
+    python scripts/generate_candidates.py --blockers exact_name        # force one blocker
+    python scripts/generate_candidates.py --workers 32                 # char verification
 
 Outputs (under ``outputs/candidates/``)::
 
     candidate_pairs.tsv          source1_entity_id, matched_entity_id,
-                                 source, blockers
+                                 source, blockers [, char_jaccard] [, token_df]
     candidate_pairs_stats.json   volume + provenance statistics
+
+The evidence columns are present only when their blocker is enabled. See
+``src/blocking.py`` for the blocker registry and the semantics of each blocker.
 """
 
 from __future__ import annotations
@@ -36,9 +48,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.blocking import (  # noqa: E402
     BLOCKER_EXACT_NAME,
+    EVIDENCE_COLUMNS,
+    KNOWN_BLOCKERS,
+    UNION_BLOCKERS,
     decode_candidates,
+    evidence_columns_for,
     load_index,
-    pack_pairs,
     truncate_per_group,
     union_blockers,
 )
@@ -54,6 +69,7 @@ from src.data_loader import (  # noqa: E402
     require_file,
 )
 from src.utils import (  # noqa: E402
+    auto_worker_count,
     fmt_int,
     log_memory,
     set_seed,
@@ -78,18 +94,73 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--chunksize", type=int, default=None, help="S1 rows per chunk")
     parser.add_argument("--max-candidates", type=int, default=None,
                         help="cap candidates per S1 (overrides blocking.max_candidates_per_source)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="verification processes for the char blocker (0 = auto)")
     parser.add_argument("--name", default="candidate_pairs", help="output file stem")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
 
-def enabled_blockers(config: dict, requested: str | None) -> list[str]:
-    """Blockers to run: explicit CLI list, else those enabled in config."""
-    if requested:
-        return [b.strip() for b in requested.split(",") if b.strip()]
+def enabled_blockers(config: dict, requested: str | None, log: logging.Logger) -> list[str]:
+    """Blockers to run: explicit CLI list, else those enabled in config.
+
+    Always returned in :data:`UNION_BLOCKERS` order, so the run - and the per-pair
+    ``blockers`` provenance string it writes - does not depend on how the list was
+    spelled on the command line.
+
+    An explicit ``--blockers`` list wins even for blockers the config leaves
+    disabled: naming them on the command line is the more specific instruction.
+    """
     blocking = config.get("blocking", {})
-    active = [name for name in (BLOCKER_EXACT_NAME,) if (blocking.get(name, {}) or {}).get("enabled", False)]
-    return active or [BLOCKER_EXACT_NAME]
+    if requested:
+        named = [b.strip() for b in requested.split(",") if b.strip()]
+        unknown = [b for b in named if b not in KNOWN_BLOCKERS]
+        if unknown:
+            raise ValueError(f"unknown blocker(s) {unknown}; expected from {KNOWN_BLOCKERS}")
+        return [b for b in UNION_BLOCKERS if b in set(named)]
+
+    active = [b for b in UNION_BLOCKERS if (blocking.get(b, {}) or {}).get("enabled", False)]
+    if active:
+        return active
+    log.warning("no blocker is enabled in config; falling back to %s", BLOCKER_EXACT_NAME)
+    return [BLOCKER_EXACT_NAME]
+
+
+def resolve_verify_workers(config: dict, requested: int | None, log: logging.Logger) -> int:
+    """Process count for the char blocker's Jaccard verification.
+
+    ``resolve_workers`` is deliberately not used: it clamps the count to the number
+    of chunks to process, and here the chunk count is not known until a query
+    arrives - it depends on how many pairs a given S1 chunk retrieves.
+    Over-provisioning is harmless (``CharNgramIndex._verify`` only hands out as many
+    shards as there is work), so the clamp is simply not applied. Precedence is
+    otherwise identical: CLI, then ``compute.num_workers``, then physical cores.
+
+    This is a pure performance knob. Verification results do not depend on it.
+    """
+    configured = config.get("compute", {}).get("num_workers", 0)
+    workers = max(1, int(requested or configured or 0) or auto_worker_count())
+    log.info("char verification workers: %s", fmt_int(workers))
+    return workers
+
+
+def format_evidence(values: np.ndarray | None, fmt: str, size: int) -> np.ndarray:
+    """One candidate-file evidence column, blank where the blocker supplied none.
+
+    A pair proposed by ``token`` has no char Jaccard and vice versa, so blanks are
+    the normal case rather than an error; they are written as an empty field so the
+    column stays a single dtype and the file stays readable by the streaming readers.
+    """
+    out = np.full(size, "", dtype=object)
+    if values is None or len(values) == 0:
+        return out
+    values = np.asarray(values, dtype=np.float64)
+    present = ~np.isnan(values)
+    if len(values) != size:
+        raise ValueError(f"evidence has {len(values)} values but {size} pairs were written")
+    if present.any():
+        out[present] = np.char.mod(fmt, values[present])
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -116,27 +187,36 @@ def main(argv: list[str] | None = None) -> int:
             log.error("candidates come from %s, got %r", TARGET_SOURCES, source)
             return 2
 
-    blockers = enabled_blockers(config, args.blockers)
-    log.info("blockers: %s", blockers)
+    try:
+        blockers = enabled_blockers(config, args.blockers, log)
+    except ValueError as error:
+        log.error("%s", error)
+        return 2
+    log.info("blockers: %s", ", ".join(blockers))
+
+    verify_workers = resolve_verify_workers(config, args.workers, log)
 
     # ---- load indexes -----------------------------------------------------
     indexes = {}
     for source in sources:
         for blocker in blockers:
             try:
-                indexes[(source, blocker)] = load_index(config, args.split, source, blocker, log=log)
+                index = load_index(
+                    config, args.split, source, blocker, log=log, workers=verify_workers
+                )
             except (FileNotFoundError, NotImplementedError) as error:
                 log.error("%s", error)
                 return 2
+            indexes[(source, blocker)] = index
+            log.info("[%s] %s", source, index.describe())
 
-    # Which normalized column each blocker keys on. All blockers must agree on
-    # the S1-side column, otherwise the comparison is meaningless.
-    key_fields = {index.key_field for index in indexes.values()}
-    if len(key_fields) > 1:
-        log.error("blockers key on different S1 columns (%s); union would be invalid", sorted(key_fields))
-        return 2
-    s1_key_field = key_fields.pop()
-    log.info("S1 key field: %s", s1_key_field)
+    # Which normalized column each blocker keys on. These are expected to differ -
+    # the token blocker keys on name_norm while the char blocker keys on name_key,
+    # and forcing either onto the other's column would silently change the blocker
+    # that was calibrated. Each index carries its own column's values, so the only
+    # requirement is that every column exists in the S1 table.
+    s1_key_fields = sorted({index.key_field for index in indexes.values()})
+    log.info("S1 key fields: %s", ", ".join(s1_key_fields))
 
     max_candidates = (
         args.max_candidates
@@ -149,6 +229,12 @@ def main(argv: list[str] | None = None) -> int:
     output_path = candidates_path(config, args.name)
     stats_path = output_path.with_name(output_path.stem + "_stats.json")
     log.info("output: %s", output_path)
+    evidence_columns = evidence_columns_for(blockers)
+    evidence_formats = {
+        EVIDENCE_COLUMNS[b][0]: EVIDENCE_COLUMNS[b][1] for b in blockers if b in EVIDENCE_COLUMNS
+    }
+    if evidence_columns:
+        log.info("evidence columns: %s", ", ".join(evidence_columns))
 
     chunksize = args.chunksize or config.get("io", {}).get("chunksize", 500_000)
     compression = config.get("io", {}).get("compression")
@@ -169,7 +255,11 @@ def main(argv: list[str] | None = None) -> int:
     def s1_chunks():
         nonlocal s1_seen
         for chunk in iter_prepared(
-            config, args.split, "source1", columns=["entity_id", s1_key_field], chunksize=chunksize
+            config,
+            args.split,
+            "source1",
+            columns=["entity_id", *s1_key_fields],
+            chunksize=chunksize,
         ):
             if args.limit_s1 is not None and s1_seen + len(chunk) > args.limit_s1:
                 chunk = chunk.iloc[: args.limit_s1 - s1_seen]
@@ -180,22 +270,28 @@ def main(argv: list[str] | None = None) -> int:
 
     with ChunkWriter(partial_path, compression=compression) as writer:
         for chunk in track(s1_chunks(), desc="generate", logger=log, total=args.limit_s1):
-            keys = chunk[s1_key_field]
             # Chunk-local S1 positions are all the packing needs; the S1 id is
             # written alongside, and groups stay contiguous in the output.
-            packed_by_blocker: dict[tuple[str, str], np.ndarray] = {}
+            packed_by_blocker: dict[str, np.ndarray] = {}
+            evidence_by_blocker: dict[str, dict[str, np.ndarray]] = {}
 
             for (source, blocker), index in indexes.items():
-                positions, counts = index.lookup_many(keys)
-                owner, codes = index.expand(positions, counts)
-                packed_by_blocker[(source, blocker)] = pack_pairs(owner, codes)
-                blocker_pair_counts[blocker] += int(len(codes))
+                # Each index queries its own key column. Nothing is looked up in
+                # another blocker's column: a token key and a trigram key are not
+                # comparable values, so a single shared query column is impossible
+                # for a mixed union.
+                packed, evidence = index.query(chunk[index.key_field])
+                packed_by_blocker[f"{source}:{blocker}"] = packed
+                if evidence:
+                    evidence_by_blocker[f"{source}:{blocker}"] = evidence
+                blocker_pair_counts[blocker] += int(len(packed))
 
             # --- union across (source, blocker) ---
             # Every array indexes the same chunk-local S1 positions, so packing
             # lets np.unique do union + dedupe + sort in a single call.
-            named = {f"{source}:{blocker}": packed for (source, blocker), packed in packed_by_blocker.items()}
-            s1_positions, entity_codes, provenance = union_blockers(named, log=None)
+            s1_positions, entity_codes, provenance, evidence = union_blockers(
+                packed_by_blocker, blocker_evidence=evidence_by_blocker, log=None
+            )
 
             # --- optional cap ---
             if max_candidates:
@@ -204,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
                     s1_positions = s1_positions[keep]
                     entity_codes = entity_codes[keep]
                     provenance = provenance[keep]
+                    evidence = {column: values[keep] for column, values in evidence.items()}
 
             counts_per_s1 = np.bincount(s1_positions, minlength=len(chunk)) if len(s1_positions) else np.zeros(len(chunk), dtype=np.int64)
             s1_with_candidates += int(np.count_nonzero(counts_per_s1))
@@ -231,6 +328,12 @@ def main(argv: list[str] | None = None) -> int:
                     "blockers": provenance,
                 }
             )
+            # Evidence columns are appended only for the blockers that are enabled,
+            # so an exact-name-only run keeps the original four-column schema.
+            for column in evidence_columns:
+                frame[column] = format_evidence(
+                    evidence.get(column), evidence_formats[column], len(entity_codes)
+                )
             total_pairs += writer.append(frame)
             log_memory(log, f"chunk done, {fmt_int(total_pairs)} pairs so far")
 
@@ -246,7 +349,10 @@ def main(argv: list[str] | None = None) -> int:
         "generated_by": "scripts/generate_candidates.py",
         "split": args.split,
         "blockers": blockers,
-        "s1_key_field": s1_key_field,
+        "s1_key_fields": s1_key_fields,
+        "evidence_columns": evidence_columns,
+        "char_verify_workers": verify_workers,
+        "indexes": {f"{source}:{blocker}": index.describe() for (source, blocker), index in indexes.items()},
         "s1_entities_processed": int(s1_seen),
         "s1_with_candidates": int(s1_with_candidates),
         "s1_without_candidates": int(s1_without_candidates),

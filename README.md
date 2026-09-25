@@ -62,6 +62,11 @@ true pairs, and no matcher recovers a pair the blocker never proposed. Of the
 (transliteration) - the case a character-level signal cannot see by
 construction.
 
+The provisional configuration shipped today reaches **57.0123%** measured pair
+recall (336,056,756 candidates, J=0.3) - the 82.19% is a signal ceiling, not a
+reachable operating point at an acceptable candidate volume. See
+[the blocker registry](#the-blocker-registry-provisional-configuration).
+
 ---
 
 ## Repository layout
@@ -238,7 +243,7 @@ plumbing, not the quality.
 # 1. Normalize all sources (~10 min, streaming, ~150 MB RSS)
 python scripts/prepare_data.py
 
-# 2. Build the inverted indexes (~2-4 min, ~250 MB peak per index)
+# 2. Build the inverted indexes (~2-4 min each, ~250 MB-1 GB peak per index)
 python scripts/build_indexes.py
 
 # 3. Generate candidate pairs for all 2.2M S1 entities
@@ -249,13 +254,18 @@ python scripts/evaluate_blocking.py --split val
 python scripts/evaluate_blocking.py --split all      # val + train + all
 ```
 
+Step 2 builds one index per enabled blocker per target source, and step 3 runs
+each of them; step 3 verifies the char candidates, so give it the node's cores
+with `--workers 0` (auto) or an explicit count. `--blockers exact_name` forces a
+single blocker for a quick run without rebuilding anything.
+
 Stage-by-stage reference:
 
 | Command | Reads | Writes | Peak RAM |
 |---|---|---|---|
 | `prepare_data.py` | `train_source{1,2,3}.tsv` | `outputs/prepared/train_source{1,2,3}_norm.tsv` | ~150 MB |
-| `build_indexes.py` | prepared S2/S3 | `outputs/indexes/train_source{2,3}_exact_name/` | ~250 MB/index |
-| `generate_candidates.py` | prepared S1 + indexes | `outputs/candidates/candidate_pairs.tsv` | ~300 MB |
+| `build_indexes.py` | prepared S2/S3 | `outputs/indexes/train_source{2,3}_<blocker>/` (one per enabled blocker) | ~250 MB-1 GB/index |
+| `generate_candidates.py` | prepared S1 + indexes | `outputs/candidates/candidate_pairs.tsv` (`token_df`/`char_jaccard` columns appear when those blockers are enabled) | ~300 MB |
 | `evaluate_blocking.py` | candidates + ground truth | `outputs/candidates/blocking_metrics_*.json` | ~600 MB |
 
 `prepare_data.py` also writes `{split}_source1_norm.tsv` with a `split` column
@@ -418,6 +428,52 @@ which lets a single `np.unique` do union + dedupe + sort at once. Each pair keep
 a `blockers` provenance column, so you can later see which blocker actually
 earns its keep.
 
+The union is never an intersection: a pair proposed by *any* enabled blocker is a
+candidate, because blocking's job is a safe over-approximation. The matcher can
+reject a false candidate; nothing downstream can recover a true pair that
+blocking never proposed.
+
+### The blocker registry (provisional configuration)
+
+Three blockers are implemented, in `src/blocking.py`. Each queries **its own**
+normalized column - a token key and a trigram key are not comparable values, so
+there is no single shared query column:
+
+| Blocker | Key column | Decision | Per-pair evidence |
+|---|---|---|---|
+| `exact_name` | `name_norm` | exact key equality | - |
+| `token` | `name_norm` | shares one eligible token (boolean, no verification) | `token_df` |
+| `char_ngram` | `name_key` | shares a rare trigram, then trigram Jaccard >= `jaccard` | `char_jaccard` |
+
+The **provisional production configuration** is the cell that was measured
+end to end - pair recall 57.0123%, 336,056,756 candidates:
+
+```text
+exact(name_norm)  UNION  token(name_norm, df<=1000, rarest 1)
+                           UNION  char(name_key, df<=1000, rarest 5, J>=0.3)
+```
+
+`df_cap` and `rarest_k` are **not tuning knobs**: they define which blocker you
+are running. Each blocker keeps, per entity, only its `rarest_k` *eligible* keys,
+where eligible means `0 < df <= df_cap` over the **target corpus** (S2 and S3 are
+counted separately, and never from S1). Eligibility is applied *before* ranking -
+an index-absent key scores `df == 0`, so ranking first would let an unretrievable
+key consume one of the entity's K slots. `scripts/build_indexes.py` builds at the
+cell directly; that is exactly equivalent to building one loose index and
+filtering it down, because eligibility is a prefix-preserving filter over the
+`(df, code)` order.
+
+Verification for `char_ngram` is the same `_trigram_jaccard` reference the
+calibration used, and a test pins it to
+`scripts/analyze_name_differences._trigram_jaccard`. `compute.num_workers` (or
+`--workers`) only shards that verification: results are identical at any worker
+count.
+
+A **DF=5000 / rarest-K=1 token variant remains an independent background
+experiment**, run through `scripts/calibrate_token_blocker.py`. It is
+deliberately *not* wired into `configs/config.yaml`, and the measured evidence
+does not currently favour it.
+
 **Candidate cap.** `blocking.max_candidates_per_source` (or `--max-candidates`)
 limits candidates per S1. This is a recall/precision trade-off, not a detail:
 capping silently deletes true matches before the matcher sees them. Choose it
@@ -533,14 +589,23 @@ outputs/
 │   └── prepare_manifest.json         row counts + settings (provenance)
 ├── indexes/
 │   ├── train_source2_exact_name/     flat .npy arrays + keys.bin + meta.json
-│   ├── train_source3_exact_name/
+│   ├── train_source2_token/          + the token vocabulary and df table
+│   ├── train_source2_char_ngram/     + target name_key blob, for verification
+│   ├── train_source3_*/
 │   └── index_summary.json
 └── candidates/
     ├── candidate_pairs.tsv           source1_entity_id, matched_entity_id,
-    │                                 source, blockers
+    │                                 source, blockers [, token_df]
+    │                                 [, char_jaccard]
     ├── candidate_pairs_stats.json
     └── blocking_metrics_*.json
 ```
+
+The evidence columns (`token_df`, `char_jaccard`) appear only when their blocker is
+enabled, so an exact-name-only run keeps the original four-column schema. A blank
+field means the blocker that owns that column did not propose the pair - an
+exact-name pair has no char Jaccard. The columns are descriptive only; `blockers`
+is what records which generator produced the pair.
 
 `candidate_pairs.tsv` is an **intermediate** artifact, not a submission. Its
 format is defined by this project; matched ids are always valid S2/S3 ids and
@@ -568,17 +633,18 @@ including the 123,247 with no match; deduplicated ids; deterministic ordering).
 * blocking evaluation: recall, volume, reduction ratio, per-entity F0.5 ceiling
 * S1-level validation split
 
-**Milestone 2 (next): more blockers, then a matcher**
+**Milestone 2 (in progress): more blockers, then a matcher**
 
 Order matters - each step should be measured before the next:
 
-1. **Token / inverted-index blocking** - shares tokens, not the whole string.
-   Expected to move recall far more than any modelling work. The generic index
-   and union machinery are already in place (`BLOCKER_TOKEN` is registered and
-   raises a clear "not implemented" error).
-2. **Character n-gram retrieval** - catches typos and transliteration variance.
-   Step 0 (`scripts/calibrate_char_blocker.py`) measures its recall x volume
-   curve before any operating parameters are chosen; see
+1. ~~**Token / inverted-index blocking**~~ - **done.** Implemented as
+   `TokenIndex` with the calibrated `(df_cap, rarest_k)` semantics and enabled in
+   the provisional configuration. See
+   [the blocker registry](#the-blocker-registry-provisional-configuration).
+2. ~~**Character n-gram retrieval**~~ - **done.** Implemented as `CharNgramIndex`
+   with the calibrated trigram Jaccard verification and enabled in the provisional
+   configuration. Step 0 (`scripts/calibrate_char_blocker.py`) measured its
+   recall x volume curve before the operating parameters were chosen; see
    [Phase 1 Step 0](#phase-1-step-0-char-3-gram-blocker-calibration). Up to
    82.19% of true pairs is the ceiling for the lexical generators.
 3. **TF-IDF / BM25 lexical retrieval**, memory-efficient.
@@ -588,6 +654,10 @@ Order matters - each step should be measured before the next:
    trees on lexical + address features, then semantic features. See
    `src/features.py` and `src/matching_model.py` for the planned contract.
 6. **Cross-encoder re-ranking** on top candidates only, if it still pays off.
+
+The next step is **step 5, the matcher**, not further blocking: at the measured
+operating point the marginal precision of the remaining name-blocking headroom is
+far below what the matcher can add by rejecting false candidates.
 
 `src/features.py`, `src/matching_model.py`, `scripts/train_model.py` and
 `scripts/predict.py` are deliberate stubs that raise `NotImplementedError` with an

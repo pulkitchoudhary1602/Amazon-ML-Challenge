@@ -1,4 +1,4 @@
-"""Blocking / candidate generation: exact normalized-name inverted index.
+"""Blocking / candidate generation: inverted indexes and the candidate union.
 
 Blocking proposes candidate pairs. It never decides whether a pair is a match -
 that is the ranking model's job. So the only thing that matters here is
@@ -7,6 +7,54 @@ that is the ranking model's job. So the only thing that matters here is
 The naive alternative is 2,206,821 x 10,320,219 = 22.8 trillion comparisons,
 which is why we index instead: look up each S1 key and read back only the rows
 that share it.
+
+The blocker registry
+--------------------
+Three blockers are implemented, and the candidate set is their **union** - a pair
+proposed by any one of them is a candidate, and the union is never an
+intersection:
+
+======================  ===========  ===============================================
+blocker                 S1 key       retrieval rule
+======================  ===========  ===============================================
+``exact_name``          name_norm    exact key equality
+``token``               name_norm    share an eligible token (``str.split()``)
+``char_ngram``          name_key    share a character trigram, then Jaccard >= 0.3
+======================  ===========  ===============================================
+
+The two multi-key blockers implement the rule measured by the calibration
+scripts, and the semantics live here in one place:
+
+* **token.** ``str.split()`` on ``name_norm``; distinct tokens; the document
+  frequency is counted over the *target* corpus, so the target source decides
+  which tokens are rare; a token is eligible when ``0 < df <= df_cap``; the
+  entity keeps its ``rarest_k`` rarest eligible tokens; sharing one is the whole
+  decision, so there is **no** verification stage.
+* **char_ngram.** character trigrams of ``name_key``; df cap and rarest-K the
+  same way; retrieval through the inverted postings; then verified with the
+  Phase 0.1 trigram Jaccard (``scripts/analyze_name_differences._trigram_jaccard``,
+  reproduced bit-for-bit by :func:`_trigram_jaccard`) against a threshold.
+
+Both codes are **injective** - dense token codes are a bijection by construction
+and a trigram code packs its three code points into 63 bits - so a key hit is a
+key match and neither blocker re-verifies strings after a lookup. That is the one
+structural difference from :class:`ExactNameIndex`, which hashes and therefore
+must compare.
+
+``rarest_k`` is applied to the keys an entity keeps, not to the postings a key
+returns: an entity spends its K slots on its rarest eligible keys, and the
+blocker retrieves through whichever of those keys the target shares. Building a
+cell directly is equivalent to building the loosest cell and filtering it down,
+because eligibility is a prefix-preserving filter over the ``(df, code)`` order
+(see :func:`_rarest_keep_mask`).
+
+Calibrated vs provisional
+-------------------------
+The default cell in :data:`BLOCKER_SETTING_DEFAULTS` is the configuration that
+measured 57.01% pair recall / 57.03% macro recall at 336,056,756 candidates
+(exact u token DF<=1000/K=1 u char DF<=1000/K=5/J>=0.3). It is the **provisional
+production configuration**. DF=5000 for the char arm is a separate background
+experiment and is deliberately not the default here.
 
 Implementation notes
 --------------------
@@ -39,6 +87,11 @@ Union semantics
 Multiple blockers each return postings for the same S1. The candidate set is
 their **union**, computed with one ``np.unique`` over packed
 ``(s1_position, entity_code)`` integers, which also deduplicates for free.
+
+Each blocker may also carry per-pair *evidence* (the char Jaccard, the rarest
+shared token's document frequency), which the union keeps aligned to the pairs it
+emits. Evidence is descriptive only: it does not change which pairs are proposed,
+and nothing here consumes it.
 """
 
 from __future__ import annotations
@@ -46,8 +99,10 @@ from __future__ import annotations
 import gc
 import logging
 import os
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional, Sequence
+from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -59,6 +114,7 @@ from .data_loader import (
     prepared_path,
     require_file,
 )
+from .normalization import NAME_KEY, NAME_NORM
 from .utils import (
     ID_NUMERIC_MODULUS,
     ID_SOURCE_NAMES,
@@ -84,6 +140,18 @@ KEY_OFFSETS_FILE = "key_offsets.npy"
 POSTINGS_FILE = "postings.npy"
 POSTINGS_OFFSETS_FILE = "postings_offsets.npy"
 
+# Multi-key index files. ``keys``/``key_df``/``postings*`` are shared by the token
+# and char blockers; the rest is blocker-specific.
+MKEYS_FILE = "mkeys.npy"
+KEY_DF_FILE = "key_df.npy"
+POSTING_ROWS_FILE = "posting_rows.npy"
+DF_CODES_FILE = "df_codes.npy"
+DF_VALUES_FILE = "df_values.npy"
+VOCAB_FILE = "vocab.bin"
+VOCAB_META_FILE = "vocab_meta.json"
+NAME_KEY_BLOB_FILE = "name_key_blob.bin"
+NAME_KEY_OFFSETS_FILE = "name_key_offsets.npy"
+
 # Packing factor for (s1_position, entity_code) -> single int64.
 # Entity codes are <= 3*10**10 + 10**9 < 3.2e10, so 10**11 separates them
 # cleanly; s1_position <= 2.2e6 gives a max packed value of ~2.2e17, well inside
@@ -98,6 +166,44 @@ BLOCKER_CHAR_NGRAM = "char_ngram"
 BLOCKER_DENSE = "dense"
 KNOWN_BLOCKERS = (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM, BLOCKER_DENSE)
 
+# The blockers a union may combine, in the order provenance is built. Fixed order
+# so the candidate output does not depend on CLI argument order.
+UNION_BLOCKERS = (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM)
+
+# Which normalized column each blocker keys on when the config does not say. The
+# char blocker keys on ``name_key`` (separators removed) because that is the
+# column its trigram signal is defined on - defaulting it to ``name_norm`` would
+# silently produce a different blocker.
+DEFAULT_KEY_FIELDS = {
+    BLOCKER_EXACT_NAME: NAME_NORM,
+    BLOCKER_TOKEN: NAME_NORM,
+    BLOCKER_CHAR_NGRAM: NAME_KEY,
+    BLOCKER_DENSE: NAME_NORM,
+}
+
+# The provisional production cell, per blocker. These are the values the
+# calibration measured; changing them changes the blocker, so they are defaults
+# for a fresh config rather than tuning knobs.
+BLOCKER_SETTING_DEFAULTS = {
+    BLOCKER_TOKEN: {"df_cap": 1000, "rarest_k": 1},
+    BLOCKER_CHAR_NGRAM: {"df_cap": 1000, "rarest_k": 5, "jaccard": 0.3},
+}
+
+# Per-pair evidence a blocker can carry into the candidate file, as
+# ``blocker -> (column_name, format)``. The column is written **only when that
+# blocker is enabled**, so an exact-name-only run keeps the original four-column
+# candidate schema. Values are empty for pairs the blocker did not propose.
+EVIDENCE_COLUMNS = {
+    BLOCKER_CHAR_NGRAM: ("char_jaccard", "%.4f"),
+    BLOCKER_TOKEN: ("token_df", "%.0f"),
+}
+
+
+def evidence_columns_for(blockers: Sequence[str]) -> list[str]:
+    """Candidate-file columns the enabled blockers add, in registry order."""
+    return [EVIDENCE_COLUMNS[b][0] for b in UNION_BLOCKERS if b in blockers and b in EVIDENCE_COLUMNS]
+
+
 
 def index_dir_for(config: dict, split: str, source: str, blocker: str) -> Path:
     """Directory holding one persisted index."""
@@ -105,11 +211,60 @@ def index_dir_for(config: dict, split: str, source: str, blocker: str) -> Path:
 
 
 def _key_field_for(config: dict, blocker: str) -> str:
-    """Which normalized column a blocker keys on, from config."""
+    """Which normalized column a blocker keys on, from config.
+
+    The default is per blocker (:data:`DEFAULT_KEY_FIELDS`) rather than a single
+    ``name_norm`` fallback, because the char blocker's signal is defined on
+    ``name_key``: a config that enables it without naming a column must get
+    ``name_key``, not a silently different blocker.
+    """
     section = config.get("blocking", {}).get(blocker, {}) or {}
-    if blocker == BLOCKER_EXACT_NAME:
-        return section.get("key", "name_norm")
-    return section.get("key", "name_norm")
+    return str(section.get("key") or DEFAULT_KEY_FIELDS.get(blocker, NAME_NORM))
+
+
+def resolve_blocker_settings(config: dict, blocker: str) -> dict:
+    """The (df_cap, rarest_k, jaccard) cell a blocker should be built at.
+
+    Merges ``blocking.<blocker>`` over :data:`BLOCKER_SETTING_DEFAULTS` and
+    validates, so a typo in the config fails loudly here instead of quietly
+    building a different blocker than the one that was calibrated.
+
+    Args:
+        config: loaded config.
+        blocker: blocker name from :data:`KNOWN_BLOCKERS`.
+
+    Returns:
+        A settings dict, empty for blockers that take no parameters.
+
+    Raises:
+        ValueError: on an unknown setting or an out-of-range value.
+    """
+    defaults = dict(BLOCKER_SETTING_DEFAULTS.get(blocker, {}))
+    if not defaults:
+        return {}
+    section = config.get("blocking", {}).get(blocker, {}) or {}
+    unknown = sorted(set(section) - set(defaults) - {"enabled", "key"})
+    if unknown:
+        raise ValueError(
+            f"blocking.{blocker} has unknown setting(s) {unknown}; expected "
+            f"{sorted(defaults)}"
+        )
+    settings = {name: section.get(name, default) for name, default in defaults.items()}
+
+    for name in ("df_cap", "rarest_k"):
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"blocking.{blocker}.{name} must be a positive integer, got {value!r}")
+        settings[name] = int(value)
+    if "jaccard" in settings:
+        value = settings["jaccard"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 < float(value) <= 1.0:
+            raise ValueError(
+                f"blocking.{blocker}.jaccard must be in (0, 1], got {value!r}"
+            )
+        settings["jaccard"] = float(value)
+    return settings
+
 
 
 # ---------------------------------------------------------------------------
@@ -585,27 +740,1467 @@ class ExactNameIndex:
         owner_index = np.repeat(np.flatnonzero(valid), counts[valid])
         return owner_index, entity_codes
 
+    def query(self, values: Sequence[str] | pd.Series) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Blocking keys for one S1 chunk, packed and deduplicated.
+
+        The uniform blocker entry point: every index in :data:`INDEX_BUILDERS`
+        exposes ``query(values) -> (packed_pairs, evidence)``, where
+        ``packed_pairs`` is the sorted unique ``pack_pairs(owner_row, entity_code)``
+        array for this chunk and ``evidence`` names any per-pair values the blocker
+        carries. For exact name matching that is
+        :meth:`lookup_many` followed by :meth:`expand` followed by one
+        ``np.unique`` - the same three steps the candidate generator has always
+        performed - so behaviour is unchanged.
+
+        Args:
+            values: the chunk's values of :attr:`key_field`.
+
+        Returns:
+            ``(packed_pairs, evidence)``; ``evidence`` is always empty here.
+        """
+        positions, counts = self.lookup_many(values)
+        owner, codes = self.expand(positions, counts)
+        if len(codes) == 0:
+            return _EMPTY_INT64, {}
+        return np.unique(pack_pairs(owner, codes)), {}
+
 
 # ---------------------------------------------------------------------------
-# Not-yet-implemented blockers (roadmap). Registered so the CLI and the config
-# already accept them; the error message says what is missing.
+# Key codecs: tokenization and character trigrams
 # ---------------------------------------------------------------------------
+# Both blockers key on codes rather than strings, and both codecs are injective,
+# so a key hit is a key match and neither needs ExactNameIndex's post-lookup string
+# comparison. The two functions below are the production home of the semantics the
+# calibration scripts measured; tests/test_production_blocking.py pins them to the
+# calibration's own functions so the two cannot drift.
+
+_MISSING_TOKEN_CODE = -1
+_EMPTY_INT64 = np.empty(0, dtype=np.int64)
+
+# Three code points packed into 63 bits: 21 bits each covers the whole Unicode
+# range (max code point 0x10FFFF < 2**21), so the packing is a bijection.
+_CODE_POINT_BITS = 21
+_CODE_POINT_MASK = (1 << _CODE_POINT_BITS) - 1
+
+
+def tokenize(text: str) -> list[str]:
+    """Tokens of an already-normalized field.
+
+    ``str.split()`` with no argument splits on any Unicode whitespace run and
+    drops empty fields - Phase 0's ``_token_set`` is exactly ``set(text.split())``.
+    A list is returned so the caller keeps the ordering decisions explicit; the
+    deduplication happens in :meth:`TokenVocabulary.codes_for_text`, since a
+    *document* frequency is what the token blocker is defined on.
+
+    Kept as a named function so the semantics have one home and the tests can
+    point at it rather than at ``str.split``.
+    """
+    return text.split() if text else []
+
+
+def trigram_codes(text: str) -> np.ndarray:
+    """Distinct character-trigram codes of ``text``, sorted ascending.
+
+    Mirrors Phase 0.1's ``{a[i:i+3] for i in range(len(a) - 2)}`` exactly: the same
+    sliding window over code points and the same deduplication, since the signal is
+    a set overlap. A name shorter than three code points yields no trigrams,
+    matching the reference having nothing to intersect - and, practically, meaning
+    such a name can never be retrieved and never needs verifying.
+
+    Sorted output is what makes selection deterministic: python's ``set`` iteration
+    order over strings varies with ``PYTHONHASHSEED``, so an unsorted set would make
+    the index unreproducible across runs.
+    """
+    points = np.frombuffer(text.encode("utf-32-le"), dtype="<u4")
+    if points.size < 3:
+        return _EMPTY_INT64
+    wide = points.astype(np.int64)
+    return np.unique((wide[:-2] << 42) | (wide[1:-1] << 21) | wide[2:])
+
+
+def decode_trigram_code(code: int) -> str:
+    """Inverse of :func:`trigram_codes` for one code, for reporting."""
+    return (
+        chr((int(code) >> 42) & _CODE_POINT_MASK)
+        + chr((int(code) >> 21) & _CODE_POINT_MASK)
+        + chr(int(code) & _CODE_POINT_MASK)
+    )
+
+
+def _trigram_codes_for_list(texts: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Codes for many strings at once, plus a flat owner index.
+
+    Returns ``(codes, owners)`` with ``owners[i]`` the row that produced
+    ``codes[i]``. One flat pair of arrays beats a list of per-row arrays when the
+    caller is going to concatenate them anyway.
+    """
+    parts: list[np.ndarray] = []
+    owners: list[np.ndarray] = []
+    for index, text in enumerate(texts):
+        codes = trigram_codes(text)
+        if codes.size:
+            parts.append(codes)
+            owners.append(np.full(codes.size, index, dtype=np.int64))
+    if not parts:
+        return _EMPTY_INT64, _EMPTY_INT64
+    return np.concatenate(parts), np.concatenate(owners)
+
+
+def _rank_within_runs(sorted_keys: np.ndarray) -> np.ndarray:
+    """Position of each element within its run of equal adjacent values.
+
+    ``sorted_keys`` must be sorted, so equal values are contiguous. This is what
+    turns an entity's df-ordered key list into ranks 0, 1, 2, ... and therefore
+    what makes a ``rank < K`` filter a prefix of each entity's keys.
+    """
+    if sorted_keys.size == 0:
+        return _EMPTY_INT64
+    starts = np.flatnonzero(np.concatenate(([True], sorted_keys[1:] != sorted_keys[:-1])))
+    spans = np.diff(np.append(starts, sorted_keys.size))
+    return np.arange(sorted_keys.size, dtype=np.int64) - np.repeat(starts, spans)
+
+
+def _rarest_keep_mask(
+    owners: np.ndarray,
+    codes: np.ndarray,
+    dfs: np.ndarray,
+    df_cap: int,
+    rarest_k: int,
+) -> np.ndarray:
+    """Which ``(owner, code, df)`` triples a ``(df_cap, rarest_k)`` cell keeps.
+
+    The rule, applied identically on both sides of a lookup:
+
+    1. a key is *eligible* when ``0 < df <= df_cap`` - a key this target corpus
+       never saw scores ``df == 0`` and a key that is too common scores above the
+       cap;
+    2. among its eligible keys an entity keeps the ``rarest_k`` rarest, ordered by
+       ``(df ascending, code ascending)`` so the choice is a total order and the
+       selection is reproducible run to run.
+
+    Eligibility is applied **before** ranking, which is what the calibration does,
+    and it has to be: an absent key scores ``df == 0``, so ranking first would let a
+    key that can never be retrieved consume one of the entity's K slots.
+
+    This is also why a build at the tight cell is equivalent to a build at the
+    loosest cell filtered down. Let ``E_tight`` be the eligible keys under a tighter
+    cap and ``E_loose`` those under a looser one; ``E_tight`` is a subset, and
+    because both are ordered by ``(df, code)`` the position of a key inside
+    ``E_tight`` equals its position inside ``E_loose`` - every key ordered before it
+    has a smaller df, hence is in both. So ``rank_tight(t) == rank_loose(t)`` for
+    every ``t`` in ``E_tight``, and truncating the loose selection at the tight K
+    keeps exactly the tight selection.
+
+    Args:
+        owners: row that produced each entry.
+        codes: key code of each entry.
+        dfs: document frequency of each entry.
+        df_cap: inclusive upper bound on an eligible key's document frequency.
+        rarest_k: how many of an entity's rarest eligible keys to keep.
+
+    Returns:
+        Boolean mask aligned to the input.
+    """
+    keep = np.zeros(len(owners), dtype=bool)
+    selected = np.flatnonzero((dfs > 0) & (dfs <= df_cap))
+    if selected.size == 0:
+        return keep
+    order = np.lexsort((codes[selected], dfs[selected], owners[selected]))
+    ranks = _rank_within_runs(owners[selected][order])
+    keep[selected[order[ranks < rarest_k]]] = True
+    return keep
+
+
+def _trigram_jaccard(a: str, b: str) -> float:
+    """Jaccard overlap of character trigrams; character sets for short strings.
+
+    Bit-for-bit the Phase 0.1 reference
+    (``scripts/analyze_name_differences._trigram_jaccard``), which is the function
+    the char blocker's threshold was calibrated against. It is reproduced rather than
+    imported because ``src/`` must not depend on ``scripts/``; a test asserts the two
+    agree on a fixture, so the duplication cannot drift.
+
+    Two details matter. The comparison is on **characters**, not code points or
+    bytes, and the ``len < 3`` branch falls back to bare character sets. The second
+    branch is unreachable for a retrieved char pair - a name shorter than three
+    characters has no trigram, so it is never in the index, never retrieved and never
+    verified - but it is kept so this is the same function, not a similar one.
+    """
+    if len(a) < 3 or len(b) < 3:
+        set_a, set_b = set(a), set(b)
+    else:
+        set_a = {a[i : i + 3] for i in range(len(a) - 2)}
+        set_b = {b[i : i + 3] for i in range(len(b) - 2)}
+    if not set_a or not set_b:
+        return 0.0
+    shared = len(set_a & set_b)
+    union = len(set_a) + len(set_b) - shared
+    return shared / union if union else 0.0
+
+
+def _as_object_array(values: Sequence[str] | pd.Series) -> np.ndarray:
+    """A chunk's key values as an object array, without copying when possible."""
+    array = values.to_numpy(dtype=object) if isinstance(values, pd.Series) else np.asarray(values)
+    return array if array.dtype == object else array.astype(object)
+
+
+def _chunk_factory(chunks: Iterable[pd.DataFrame] | Callable[[], Iterator[pd.DataFrame]]):
+    """Normalize a chunk source to a zero-argument factory.
+
+    Multi-pass builders (df counting, then the index build) must be able to read
+    the source twice. Passing a bare generator and calling it twice silently yields
+    an empty second pass, so builders ask for a factory and the multi-pass ones
+    reject a source that produced rows once and then nothing.
+    """
+    if callable(chunks):
+        return chunks
+
+    def _factory() -> Iterator[pd.DataFrame]:
+        return iter(chunks)
+
+    return _factory
+
+
+# ---------------------------------------------------------------------------
+# Corpus-relative document frequency
+# ---------------------------------------------------------------------------
+class DocumentFrequency:
+    """Key code -> document frequency, over one target source's corpus.
+
+    Corpus-relative by construction: counted from the prepared target table of this
+    run, so each target source has its own notion of which keys are rare. ``codes``
+    is sorted, which turns a lookup into one ``searchsorted`` over the whole query
+    array.
+
+    A code the table does not carry scores ``0``. That is the correct reading for
+    both callers: a trigram this corpus never contained and a token this corpus
+    never contained are equally ineligible, and ``df == 0`` is how the blocker says
+    so.
+    """
+
+    __slots__ = ("codes", "values")
+
+    def __init__(self, codes: np.ndarray, values: np.ndarray) -> None:
+        self.codes = codes
+        self.values = values
+
+    def __len__(self) -> int:
+        return len(self.codes)
+
+    def lookup(self, codes: np.ndarray) -> np.ndarray:
+        """Document frequency of each code; ``0`` for a code never seen."""
+        if codes.size == 0 or self.codes.size == 0:
+            return np.zeros(codes.size, dtype=np.int64)
+        positions = np.searchsorted(self.codes, codes).astype(np.int64)
+        np.clip(positions, 0, len(self.codes) - 1, out=positions)
+        return np.where(self.codes[positions] == codes, self.values[positions], 0)
+
+    def describe(self) -> dict:
+        if len(self.values) == 0:
+            return {"n_distinct_keys": 0}
+        return {
+            "n_distinct_keys": int(len(self.codes)),
+            "total_occurrences": int(self.values.sum()),
+            "max_df": int(self.values.max()),
+            "median_df": float(np.median(self.values)),
+        }
+
+    def save(self, directory: str | os.PathLike) -> None:
+        directory = ensure_dir(directory)
+        np.save(Path(directory) / DF_CODES_FILE, self.codes)
+        np.save(Path(directory) / DF_VALUES_FILE, self.values)
+
+    @classmethod
+    def load(cls, directory: str | os.PathLike) -> "DocumentFrequency":
+        directory = Path(directory)
+        return cls(codes=np.load(directory / DF_CODES_FILE), values=np.load(directory / DF_VALUES_FILE))
+
+
+def _count_code_df(
+    chunks: Iterable[pd.DataFrame],
+    field: str,
+    encoder: Callable[[Sequence[str]], tuple[np.ndarray, np.ndarray]],
+    log: logging.Logger,
+    label: str,
+    kind: str,
+) -> DocumentFrequency:
+    """Count key document frequency over a streamed target table.
+
+    Per-chunk dedup, then one global merge: each chunk contributes its distinct codes
+    with counts, and the pieces are concatenated, sorted once and folded with
+    ``add.reduceat``. Deduplicating per chunk keeps the merge proportional to the
+    distinct key count rather than to the total occurrence count.
+    """
+    parts_codes: list[np.ndarray] = []
+    parts_counts: list[np.ndarray] = []
+    rows = 0
+
+    for frame in chunks:
+        texts = frame[field].to_numpy(dtype=object)
+        rows += len(texts)
+        codes, _ = encoder(texts)
+        if codes.size:
+            unique, counts = np.unique(codes, return_counts=True)
+            parts_codes.append(unique)
+            parts_counts.append(counts.astype(np.int64))
+        log.info("  %s: %s rows scanned for %s df", label, f"{rows:,}", kind)
+
+    if not parts_codes:
+        log.warning("%s: no %s found in %s rows", label, kind, f"{rows:,}")
+        return DocumentFrequency(_EMPTY_INT64, _EMPTY_INT64)
+
+    all_codes = np.concatenate(parts_codes)
+    all_counts = np.concatenate(parts_counts)
+    del parts_codes, parts_counts
+    gc.collect()
+
+    order = np.argsort(all_codes, kind="stable")
+    all_codes, all_counts = all_codes[order], all_counts[order]
+    del order
+    gc.collect()
+
+    starts = np.flatnonzero(np.concatenate(([True], all_codes[1:] != all_codes[:-1])))
+    table = DocumentFrequency(all_codes[starts], np.add.reduceat(all_counts, starts))
+    log.info(
+        "%s: %s distinct %s over %s rows",
+        label,
+        f"{len(table):,}",
+        kind,
+        f"{rows:,}",
+    )
+    return table
+
+
+# ---------------------------------------------------------------------------
+# Token vocabulary
+# ---------------------------------------------------------------------------
+class TokenVocabulary:
+    """Bijective token -> dense int64 code map, per target source.
+
+    Dense codes in order of first appearance, deliberately not hashes. A hash-keyed
+    index must re-verify the string after a lookup because two tokens can collide;
+    with a bijection there is nothing to verify, which is exactly the property that
+    lets one multi-key index serve both the token and the char blocker.
+
+    Insertion order depends only on corpus order, never on chunk size, so the
+    vocabulary is reproducible run to run and a rebuilt index renumbers identically.
+    The codes are part of the on-disk format, so they are persisted rather than
+    re-derived: a re-derived vocabulary that disagreed by one token would silently
+    invalidate every key in the index.
+    """
+
+    __slots__ = ("source", "_codes", "_tokens")
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self._codes: dict[str, int] = {}
+        self._tokens: list[str] = []
+
+    def __len__(self) -> int:
+        return len(self._tokens)
+
+    @property
+    def tokens(self) -> list[str]:
+        return self._tokens
+
+    def intern(self, token: str) -> int:
+        """Existing code for ``token``, assigning the next one if it is new."""
+        code = self._codes.get(token)
+        if code is None:
+            code = len(self._tokens)
+            self._codes[token] = code
+            self._tokens.append(token)
+        return code
+
+    def codes_for_text(self, text: str) -> np.ndarray:
+        """Distinct token codes of one text, ascending. Empty when it has no token.
+
+        The dedup is what makes the frequency a DOCUMENT frequency: a name that says
+        "acme" twice contributes one count for "acme", because the token signal is
+        set overlap and Phase 0's ``_token_set`` is a set.
+        """
+        tokens = tokenize(text)
+        if not tokens:
+            return _EMPTY_INT64
+        if len(tokens) == 1:
+            return np.asarray([self.intern(tokens[0])], dtype=np.int64)
+        seen: set[int] = set()
+        intern = self.intern
+        for token in tokens:
+            seen.add(intern(token))
+        out = np.fromiter(seen, dtype=np.int64, count=len(seen))
+        out.sort()
+        return out
+
+    def codes_for_texts(self, texts: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
+        """``(codes, owners)`` for a target-corpus pass. Grows the vocabulary.
+
+        The token twin of :func:`_trigram_codes_for_list`: the same contract (codes
+        ascending within a row, owners giving the row each code came from), so every
+        downstream algorithm consuming it is unchanged.
+        """
+        parts: list[np.ndarray] = []
+        owners: list[np.ndarray] = []
+        for row, text in enumerate(texts):
+            codes = self.codes_for_text(text)
+            if codes.size == 0:
+                continue
+            parts.append(codes)
+            owners.append(np.full(codes.size, row, dtype=np.int64))
+        if not parts:
+            return _EMPTY_INT64, _EMPTY_INT64
+        return np.concatenate(parts), np.concatenate(owners)
+
+    def lookup_texts(self, texts: Sequence[str]) -> tuple[np.ndarray, np.ndarray, int]:
+        """``(codes, owners, n_texts_without_tokens)`` for tokens already known.
+
+        Read-only, and that is the point: a token this source's corpus never contained
+        resolves to a negative code instead of being interned, so an S1-only token
+        lands in the "absent from this source" bucket (``df == 0``) rather than
+        inventing a key. Interning during a query would grow the vocabulary and
+        invalidate the index it is being used to query.
+        """
+        parts: list[np.ndarray] = []
+        owners: list[np.ndarray] = []
+        empty = 0
+        codes_of = self._codes
+        for row, text in enumerate(texts):
+            tokens = tokenize(text)
+            if not tokens:
+                empty += 1
+                continue
+            # Two absent tokens are two distinct tokens, not one. Giving each its own
+            # negative code (real codes are >= 0) stops the dedup from collapsing
+            # them, so "acme private limited" against a corpus that knows only "acme"
+            # reports two absent tokens rather than one. Every negative code scores 0
+            # in DocumentFrequency.lookup, so all of them land in the absent bucket
+            # whichever sentinel they got.
+            seen: set[int] = set()
+            missing: dict[str, int] = {}
+            for token in tokens:
+                code = codes_of.get(token)
+                if code is None:
+                    code = missing.get(token)
+                    if code is None:
+                        code = _MISSING_TOKEN_CODE - len(missing)
+                        missing[token] = code
+                seen.add(code)
+            codes = np.fromiter(seen, dtype=np.int64, count=len(seen))
+            codes.sort()
+            parts.append(codes)
+            owners.append(np.full(codes.size, row, dtype=np.int64))
+        if not parts:
+            return _EMPTY_INT64, _EMPTY_INT64, empty
+        return np.concatenate(parts), np.concatenate(owners), empty
+
+    # -- persistence --------------------------------------------------------
+    def save(self, directory: str | os.PathLike) -> None:
+        directory = ensure_dir(directory)
+        blob = b"\x00".join(token.encode("utf-8") for token in self._tokens)
+        (Path(directory) / VOCAB_FILE).write_bytes(blob)
+        # The byte count is recorded so ``load`` can detect a truncated blob: a blob
+        # cut mid-token still splits into the right number of NUL-separated fields
+        # (one short final field), so the token count alone cannot see the damage.
+        write_json(
+            Path(directory) / VOCAB_META_FILE,
+            {"source": self.source, "n_tokens": len(self._tokens), "blob_bytes": len(blob)},
+        )
+
+    @classmethod
+    def load(cls, directory: str | os.PathLike, source: str) -> "TokenVocabulary":
+        directory = Path(directory)
+        meta = read_json(directory / VOCAB_META_FILE)
+        blob = (directory / VOCAB_FILE).read_bytes()
+        vocab = cls(source)
+        n_tokens = int(meta["n_tokens"])
+        if n_tokens == 0:
+            return vocab
+        expected_bytes = int(meta["blob_bytes"])
+        if len(blob) != expected_bytes:
+            raise ValueError(
+                f"{directory}: vocabulary blob is {len(blob)} bytes but the meta says "
+                f"{expected_bytes}"
+            )
+        # One split rather than a million slices: the blob is NUL-joined and no token
+        # can contain NUL (normalization maps punctuation to spaces), so the split is
+        # exact.
+        tokens = blob.split(b"\x00")
+        if len(tokens) != n_tokens:
+            raise ValueError(
+                f"{directory}: vocabulary blob holds {len(tokens)} tokens but the meta "
+                f"says {n_tokens}"
+            )
+        vocab._tokens = [token.decode("utf-8") for token in tokens]
+        vocab._codes = {token: code for code, token in enumerate(vocab._tokens)}
+        return vocab
+
+
+# ---------------------------------------------------------------------------
+# Multi-key inverted index (token and char-ngram)
+# ---------------------------------------------------------------------------
+def _read_index_meta(directory: Path, blocker: str) -> dict:
+    """Read and validate an index's meta.json for a specific blocker."""
+    meta_path = directory / META_FILE
+    if not meta_path.is_file():
+        raise FileNotFoundError(
+            f"no index at {directory}\n  Run: python scripts/build_indexes.py"
+        )
+    meta = read_json(meta_path)
+    version = meta.get("index_version")
+    if version != INDEX_VERSION:
+        raise ValueError(
+            f"index at {directory} has version {version}, expected {INDEX_VERSION}. "
+            f"Rebuild it (delete the directory and rerun build_indexes.py)."
+        )
+    if meta.get("blocker") != blocker:
+        raise ValueError(
+            f"index at {directory} was built by blocker {meta.get('blocker')!r}, not "
+            f"{blocker!r}; the directory is mislabelled - rebuild it"
+        )
+    return meta
+
+
+class MultiKeyIndex:
+    """CSR inverted index in which one entity contributes many keys.
+
+    The same shape as :class:`ExactNameIndex` - sorted keys, offsets into a flat
+    posting array - with the three differences a token or n-gram blocker requires:
+
+    * **multi-key.** One entity contributes many keys, so the query side holds a key
+      list per row rather than one key per row. ``ExactNameIndex``'s
+      one-key-per-entity layout cannot express that.
+    * **exact codes.** Keys are dense token codes or 63-bit trigram codes, never
+      hashes. Both encodings are injective, so there is no collision to verify away
+      and a lookup needs no string comparison.
+    * **key_df.** Every key carries its target-corpus document frequency, which makes
+      the ``df_cap`` a mask on this array and the index self-contained.
+
+    Postings within a key are ordered by entity code, so a rebuild of the same corpus
+    produces the same arrays. Posting order does not affect the candidate *set* - the
+    union sorts by packed pair - but it does have to be a total order for the index to
+    be reproducible.
+
+    Attributes:
+        keys: sorted unique key codes.
+        key_df: document frequency of each key, aligned to ``keys``.
+        postings: entity id codes, grouped by key.
+        df: the **full** target-corpus document-frequency table, over every code the
+            corpus contained and not just the keys the index kept. Queries rank an
+            entity's keys against this table, and a key outside the index must still
+            score its true df - scoring it 0 would exempt it from ranking, free one of
+            the entity's ``rarest_k`` slots, and retrieve candidates a direct build at
+            the same cell would not.
+    """
+
+    __slots__ = (
+        "source",
+        "prefix",
+        "key_field",
+        "keys",
+        "key_df",
+        "postings_offsets",
+        "postings",
+        "df_cap",
+        "rarest_k",
+        "n_entities_indexed",
+        "n_rows_without_key",
+        "df",
+        "directory",
+    )
+
+    def __init__(
+        self,
+        source: str,
+        prefix: str,
+        key_field: str,
+        keys: np.ndarray,
+        key_df: np.ndarray,
+        postings_offsets: np.ndarray,
+        postings: np.ndarray,
+        df_cap: int,
+        rarest_k: int,
+        df: DocumentFrequency,
+        n_entities_indexed: int = 0,
+        n_rows_without_key: int = 0,
+        directory: Optional[Path] = None,
+    ) -> None:
+        self.source = source
+        self.prefix = prefix
+        self.key_field = key_field
+        self.keys = keys
+        self.key_df = key_df
+        self.postings_offsets = postings_offsets
+        self.postings = postings
+        self.df = df
+        self.df_cap = int(df_cap)
+        self.rarest_k = int(rarest_k)
+        self.n_entities_indexed = int(n_entities_indexed)
+        self.n_rows_without_key = int(n_rows_without_key)
+        self.directory = directory
+
+    # -- introspection ------------------------------------------------------
+    @property
+    def n_keys(self) -> int:
+        return len(self.keys)
+
+    @property
+    def n_postings(self) -> int:
+        return len(self.postings)
+
+    @property
+    def average_postings_per_key(self) -> float:
+        return self.n_postings / self.n_keys if self.n_keys else 0.0
+
+    def memory_bytes(self) -> int:
+        return (
+            self.keys.nbytes
+            + self.key_df.nbytes
+            + self.postings_offsets.nbytes
+            + self.postings.nbytes
+        )
+
+    def describe(self) -> dict:
+        counts = np.diff(self.postings_offsets)
+        return {
+            "source": self.source,
+            "key_field": self.key_field,
+            "df_cap": self.df_cap,
+            "rarest_k": self.rarest_k,
+            "n_entities_indexed": int(self.n_entities_indexed),
+            "n_rows_without_key": int(self.n_rows_without_key),
+            "n_unique_keys": int(self.n_keys),
+            "n_distinct_keys_in_corpus": int(len(self.df)),
+            "n_postings": int(self.n_postings),
+            "avg_postings_per_key": round(self.average_postings_per_key, 3),
+            "max_postings_per_key": int(counts.max()) if counts.size else 0,
+            "index_memory": human_bytes(self.memory_bytes()),
+        }
+
+    def key_count_at(self, position: int) -> int:
+        """Postings held by the key at ``position`` (a CSR slice length)."""
+        return int(self.postings_offsets[position + 1] - self.postings_offsets[position])
+
+    # -- query --------------------------------------------------------------
+    def positions_for_codes(self, codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Binary search for key codes; returns ``(position, found)``.
+
+        The int64-code twin of ``ExactNameIndex._positions_for_hashes``, minus the
+        string re-verification that a hash-based key needs and an injective encoding
+        does not.
+        """
+        if codes.size == 0:
+            return _EMPTY_INT64, np.zeros(0, dtype=bool)
+        if self.n_keys == 0:
+            return np.full(codes.size, -1, dtype=np.int64), np.zeros(codes.size, dtype=bool)
+        positions = np.searchsorted(self.keys, codes).astype(np.int64)
+        clipped = np.minimum(positions, self.n_keys - 1)
+        found = (positions < self.n_keys) & (self.keys[clipped] == codes)
+        return np.where(found, clipped, -1), found
+
+    def lookup_many(self, codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Batched lookup returning ``(positions, counts)``, ``-1`` on a miss."""
+        positions, found = self.positions_for_codes(np.asarray(codes, dtype=np.int64))
+        counts = np.zeros(positions.size, dtype=np.int64)
+        if found.any():
+            index = positions[found]
+            counts[found] = self.postings_offsets[index + 1] - self.postings_offsets[index]
+        return positions, counts
+
+    def _flat_indices(
+        self, positions: np.ndarray, counts: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """``(owner_index, flat_posting_index)`` for CSR ``(positions, counts)``.
+
+        The one implementation of the repeat/arange expansion; :meth:`expand` and
+        every ``query`` are built on it so they cannot disagree. ``owner_index[i]``
+        is the position **in the array ``positions`` was indexed by** that produced
+        posting ``i`` - the query row when ``positions`` covers every key of every
+        row (as in :meth:`expand`), and the position within the looked-up key subset
+        when a query first filters its keys down to the rarest ``rarest_k``. A query
+        that filtered must map back through its subset before packing, or pairs get
+        attributed to the wrong row.
+        """
+        total = int(counts.sum())
+        if total == 0:
+            return _EMPTY_INT64, _EMPTY_INT64
+        valid = positions >= 0
+        start_offsets = self.postings_offsets[positions[valid]]
+        starts_flat = np.repeat(start_offsets, counts[valid])
+        group_base = np.repeat(np.cumsum(counts[valid]) - counts[valid], counts[valid])
+        within_group = np.arange(total, dtype=np.int64) - group_base
+        owner_index = np.repeat(np.flatnonzero(valid), counts[valid])
+        return owner_index, starts_flat + within_group
+
+    def expand(self, positions: np.ndarray, counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """CSR expand into ``(owner_index, entity_codes)``.
+
+        Deliberately identical to ``ExactNameIndex.expand`` - the same repeat/arange
+        arithmetic producing the same ordering - so candidate ordering downstream
+        matches the shipped generator.
+        """
+        owners, flat = self._flat_indices(positions, counts)
+        if owners.size == 0:
+            return owners, _EMPTY_INT64
+        return owners, self.postings[flat]
+
+    # -- shared query steps -------------------------------------------------
+    def _query_keys(
+        self, codes: np.ndarray, owners: np.ndarray, dfs: np.ndarray
+    ) -> np.ndarray:
+        """Positions of the keys a ``(df_cap, rarest_k)`` cell would look up.
+
+        The index's own ``df_cap``/``rarest_k`` are the cell it was built at, so a
+        query needs no parameters: an index *is* a blocker configuration.
+        """
+        keep = _rarest_keep_mask(owners, codes, dfs, self.df_cap, self.rarest_k)
+        return np.flatnonzero(keep)
+
+    # -- persistence --------------------------------------------------------
+    def _save_common(self, directory: Path) -> None:
+        np.save(directory / MKEYS_FILE, self.keys)
+        np.save(directory / KEY_DF_FILE, self.key_df)
+        np.save(directory / POSTINGS_OFFSETS_FILE, self.postings_offsets)
+        np.save(directory / POSTINGS_FILE, self.postings)
+
+    def _common_meta(self, blocker: str, files: dict[str, str], extra: Optional[dict] = None) -> dict:
+        meta = {
+            "index_version": INDEX_VERSION,
+            "blocker": blocker,
+            "source": self.source,
+            "prefix": self.prefix,
+            "key_field": self.key_field,
+            "df_cap": int(self.df_cap),
+            "rarest_k": int(self.rarest_k),
+            "n_entities_indexed": int(self.n_entities_indexed),
+            "n_rows_without_key": int(self.n_rows_without_key),
+            "n_unique_keys": int(self.n_keys),
+            "n_postings": int(self.n_postings),
+            "files": {
+                "keys": MKEYS_FILE,
+                "key_df": KEY_DF_FILE,
+                "postings": POSTINGS_FILE,
+                "postings_offsets": POSTINGS_OFFSETS_FILE,
+                **files,
+            },
+        }
+        if extra:
+            meta.update(extra)
+        return meta
+
+    @classmethod
+    def _load_common(cls, directory: Path):
+        return (
+            np.load(directory / MKEYS_FILE),
+            np.load(directory / KEY_DF_FILE),
+            np.load(directory / POSTINGS_OFFSETS_FILE),
+            np.load(directory / POSTINGS_FILE),
+        )
+
+
+class TokenIndex(MultiKeyIndex):
+    """Blocking on shared rare tokens of ``name_norm``.
+
+    The token signal is **boolean**: sharing one eligible token *is* the blocker's
+    decision, so there is no verification stage and no threshold. What makes it
+    selective is the rarity rule - a token is eligible only when ``0 < df <= df_cap``
+    over the target corpus, and an entity spends its ``rarest_k`` slots on its rarest
+    eligible tokens - so "acme" (df in the millions) is never a key, while a rare
+    brand token is.
+    """
+
+    __slots__ = ("vocabulary",)
+
+    def __init__(self, *args: Any, vocabulary: TokenVocabulary, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.vocabulary = vocabulary
+
+    def describe(self) -> dict:
+        out = super().describe()
+        out["vocabulary_size"] = int(len(self.vocabulary))
+        return out
+
+    # -- build --------------------------------------------------------------
+    @classmethod
+    def build(
+        cls,
+        chunks: Iterable[pd.DataFrame] | Callable[[], Iterator[pd.DataFrame]],
+        source: str,
+        prefix: str,
+        key_field: str = NAME_NORM,
+        log: Optional[logging.Logger] = None,
+        total_rows: Optional[int] = None,
+        df_cap: int = 1000,
+        rarest_k: int = 1,
+    ) -> "TokenIndex":
+        """Build the token index for one target source.
+
+        Two passes over the target table: the first counts token document frequency
+        **and builds the vocabulary** (codes are assigned on first sight, so the df
+        table and the index that follows share one numbering), the second selects each
+        entity's rarest ``rarest_k`` tokens and appends its postings. The df pass has to
+        come first for either to mean anything - "rare" is defined relative to the
+        corpus the index covers.
+        """
+        log = log or logger
+        factory = _chunk_factory(chunks)
+        vocabulary = TokenVocabulary(source)
+        label = f"[{source}] token"
+
+        df = _count_code_df(
+            factory(), key_field, vocabulary.codes_for_texts, log, label, "tokens"
+        )
+
+        parts_keys: list[np.ndarray] = []
+        parts_codes: list[np.ndarray] = []
+        rows = 0
+        indexed_entities = 0
+        rows_without_key = 0
+
+        for frame in factory():
+            texts = frame[key_field].to_numpy(dtype=object)
+            entity_codes = encode_entity_ids(frame["entity_id"])
+            codes, owners = vocabulary.codes_for_texts(texts)
+            rows += len(texts)
+
+            if codes.size == 0:
+                rows_without_key += len(texts)
+                continue
+
+            dfs = df.lookup(codes)
+            selected = _rarest_keep_mask(owners, codes, dfs, df_cap, rarest_k)
+            if not selected.any():
+                rows_without_key += len(texts)
+                continue
+
+            survivors = np.unique(owners[selected])
+            indexed_entities += int(survivors.size)
+            rows_without_key += len(texts) - int(survivors.size)
+
+            parts_keys.append(codes[selected])
+            parts_codes.append(entity_codes[owners[selected]])
+
+        if not parts_keys:
+            log.warning("%s: no indexable tokens; the df cap of %s removed every key", label, df_cap)
+            return cls(
+                source=source,
+                prefix=prefix,
+                key_field=key_field,
+                keys=_EMPTY_INT64,
+                key_df=np.empty(0, dtype=np.int32),
+                postings_offsets=np.zeros(1, dtype=np.int64),
+                postings=_EMPTY_INT64,
+                df_cap=df_cap,
+                rarest_k=rarest_k,
+                vocabulary=vocabulary,
+                df=df,
+            )
+
+        keys, postings, offsets = _group_postings(parts_keys, parts_codes)
+        log.info(
+            "%s: token index built (%s); %s entities indexed, %s rows contributed no "
+            "surviving key",
+            label,
+            f"{len(keys):,} keys / {len(postings):,} postings",
+            f"{indexed_entities:,}",
+            f"{rows_without_key:,}",
+        )
+        return cls(
+            source=source,
+            prefix=prefix,
+            key_field=key_field,
+            keys=keys,
+            key_df=df.lookup(keys).astype(np.int32),
+            postings_offsets=offsets,
+            postings=postings,
+            df_cap=df_cap,
+            rarest_k=rarest_k,
+            n_entities_indexed=indexed_entities,
+            n_rows_without_key=rows_without_key,
+            vocabulary=vocabulary,
+            df=df,
+        )
+
+    # -- query --------------------------------------------------------------
+    def query(self, values: Sequence[str] | pd.Series) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Token candidates for one S1 chunk, plus each pair's rarest shared token df.
+
+        Read-only over the vocabulary: an S1 token this source never contained stays
+        absent (``df == 0``) instead of being interned, so it cannot consume one of
+        the entity's K slots - which is exactly why eligibility is checked before
+        ranking.
+
+        The evidence is the smallest target-corpus df among the entity's kept tokens
+        that retrieved the pair, i.e. how rare the shared token actually was. It is
+        descriptive; the blocker's decision is unchanged by it.
+        """
+        texts = _as_object_array(values)
+        if texts.size == 0:
+            return _EMPTY_INT64, {}
+        codes, owners, _ = self.vocabulary.lookup_texts(texts)
+        if codes.size == 0:
+            return _EMPTY_INT64, {}
+
+        dfs = self.df.lookup(codes)
+        take = self._query_keys(codes, owners, dfs)
+        if take.size == 0:
+            return _EMPTY_INT64, {}
+
+        positions, counts = self.lookup_many(codes[take])
+        if int(counts.sum()) == 0:
+            return _EMPTY_INT64, {}
+        key_owner, flat = self._flat_indices(positions, counts)
+        # ``key_owner`` indexes the rarest-K subset, so it is mapped back to the
+        # original query row before packing; evidence is read off the subset.
+        packed = pack_pairs(owners[take][key_owner], self.postings[flat])
+        shared_df = dfs[take][key_owner].astype(np.float64)
+
+        unique_packed, inverse = np.unique(packed, return_inverse=True)
+        rarest = np.full(unique_packed.size, np.inf, dtype=np.float64)
+        np.minimum.at(rarest, inverse, shared_df)
+        return unique_packed, {"token_df": rarest}
+
+    # -- persistence --------------------------------------------------------
+    def save(self, directory: str | os.PathLike) -> Path:
+        directory = ensure_dir(directory)
+        self._save_common(Path(directory))
+        self.vocabulary.save(directory)
+        self.df.save(directory)
+        write_json(
+            Path(directory) / META_FILE,
+            self._common_meta(
+                BLOCKER_TOKEN,
+                {"vocab": VOCAB_FILE, "vocab_meta": VOCAB_META_FILE, "df_codes": DF_CODES_FILE, "df_values": DF_VALUES_FILE},
+                {"vocabulary_size": int(len(self.vocabulary))},
+            ),
+        )
+        self.directory = Path(directory)
+        return Path(directory)
+
+    @classmethod
+    def load(cls, directory: str | os.PathLike, log: Optional[logging.Logger] = None) -> "TokenIndex":
+        directory = Path(directory)
+        meta = _read_index_meta(directory, BLOCKER_TOKEN)
+        keys, key_df, postings_offsets, postings = cls._load_common(directory)
+        index = cls(
+            source=meta["source"],
+            prefix=meta["prefix"],
+            key_field=meta["key_field"],
+            keys=keys,
+            key_df=key_df,
+            postings_offsets=postings_offsets,
+            postings=postings,
+            df_cap=int(meta["df_cap"]),
+            rarest_k=int(meta["rarest_k"]),
+            n_entities_indexed=int(meta.get("n_entities_indexed", 0)),
+            n_rows_without_key=int(meta.get("n_rows_without_key", 0)),
+            vocabulary=TokenVocabulary.load(directory, meta["source"]),
+            df=DocumentFrequency.load(directory),
+            directory=directory,
+        )
+        if log:
+            log.info("loaded index %s: %s", directory.name, index.describe())
+        return index
+
+
+def _group_postings(
+    parts_keys: Sequence[np.ndarray],
+    parts_postings: Sequence[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sort ``(key, posting)`` pairs key-major; return ``(keys, postings, offsets)``.
+
+    Postings are ordered by entity code inside a key. ``lexsort`` is stable and the
+    pair is a total order once entity codes are distinct, so the layout is
+    reproducible - which is what makes a rebuilt index produce identical arrays.
+    """
+    all_keys = np.concatenate(parts_keys)
+    all_postings = np.concatenate(parts_postings)
+    order = np.lexsort((all_postings, all_keys))
+    all_keys, all_postings = all_keys[order], all_postings[order]
+    starts = np.flatnonzero(np.concatenate(([True], all_keys[1:] != all_keys[:-1])))
+    offsets = np.concatenate((starts, [len(all_keys)])).astype(np.int64)
+    return all_keys[starts], all_postings, offsets
+
+
+# ---------------------------------------------------------------------------
+# Character n-gram index and its verification stage
+# ---------------------------------------------------------------------------
+# Jaccard payloads are batched to bound the transient list of decoded strings a
+# worker holds; the calibration used the same shape.
+VERIFY_CHUNK_PAIRS = 50_000
+
+_CHAR_WORKER_STATE: dict[str, Any] = {}
+
+
+def _char_verify_init(directory: str) -> None:
+    """Record where the target name-key blob lives; load it on first use.
+
+    Passed as a path rather than a value: the blob is hundreds of MB, and pickling it
+    to every worker would cost more than the verification it supports. Lazy loading
+    also means a worker that only ever sees source2 never pays for source3.
+    """
+    _CHAR_WORKER_STATE.clear()
+    _CHAR_WORKER_STATE["directory"] = directory
+    _CHAR_WORKER_STATE["store"] = None
+
+
+def _char_verify_store() -> tuple[np.ndarray, bytes]:
+    store = _CHAR_WORKER_STATE.get("store")
+    if store is None:
+        directory = Path(_CHAR_WORKER_STATE["directory"])
+        store = (
+            np.load(directory / NAME_KEY_OFFSETS_FILE),
+            (directory / NAME_KEY_BLOB_FILE).read_bytes(),
+        )
+        _CHAR_WORKER_STATE["store"] = store
+    return store
+
+
+def _target_name_at(offsets: np.ndarray, blob: bytes, row: int) -> str:
+    """The ``name_key`` of one target table row, decoded from the blob."""
+    return blob[int(offsets[row]) : int(offsets[row + 1])].decode("utf-8")
+
+
+def _char_verify_chunk(payload: tuple[list[str], np.ndarray]) -> np.ndarray:
+    """Exact trigram Jaccard for one payload of pairs.
+
+    Calls :func:`_trigram_jaccard` unchanged, on decoded names, so the threshold a
+    query applies is the same signal the calibration measured - including the branch
+    that falls back to bare character sets for names shorter than three characters.
+    """
+    s1_keys, target_rows = payload
+    offsets, blob = _char_verify_store()
+    out = np.zeros(len(s1_keys), dtype=np.float64)
+    for index in range(len(s1_keys)):
+        row = int(target_rows[index])
+        if row < 0:
+            continue
+        out[index] = _trigram_jaccard(s1_keys[index], _target_name_at(offsets, blob, row))
+    return out
+
+
+class CharNgramIndex(MultiKeyIndex):
+    """Blocking on shared character trigrams of ``name_key``, then Jaccard.
+
+    Retrieval is by rare trigram, because a trigram alone is far too weak a signal to
+    propose a pair: the df cap and the rarest-K rule are what keep common trigrams
+    ("ing", "the") from pairing half the corpus with the other half. On top of that
+    the blocker **verifies**: a retrieved pair is kept only when the trigram Jaccard
+    of the two ``name_key`` values reaches the threshold. Retrieval is therefore a
+    proposal and the Jaccard is the decision, which is why the threshold is part of
+    the blocker's identity and not a downstream ranking knob.
+
+    The target-side ``name_key`` values are stored alongside the postings, so the
+    index is self-contained: verification needs both strings, and the S1 side arrives
+    with the query.
+
+    Attributes:
+        posting_rows: table row of each posting, so a pair can be verified without a
+            second lookup structure.
+        jaccard_threshold: inclusive Jaccard cut-off for a retrieved pair.
+        workers: process count for verification. A runtime property, not semantics -
+            results are identical at any worker count.
+    """
+
+    __slots__ = (
+        "posting_rows",
+        "name_key_offsets",
+        "name_key_blob",
+        "jaccard_threshold",
+        "workers",
+        "verify_chunk_pairs",
+    )
+
+    def __init__(
+        self,
+        *args: Any,
+        posting_rows: np.ndarray,
+        name_key_offsets: np.ndarray,
+        name_key_blob: bytes,
+        jaccard_threshold: float,
+        workers: int = 1,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.posting_rows = posting_rows
+        self.name_key_offsets = name_key_offsets
+        self.name_key_blob = name_key_blob
+        self.jaccard_threshold = float(jaccard_threshold)
+        self.workers = max(1, int(workers))
+        self.verify_chunk_pairs = VERIFY_CHUNK_PAIRS
+
+    @property
+    def n_rows(self) -> int:
+        return len(self.name_key_offsets) - 1
+
+    def name_key_at_row(self, row: int) -> str:
+        return self.name_key_blob[int(self.name_key_offsets[row]) : int(self.name_key_offsets[row + 1])].decode("utf-8")
+
+    def memory_bytes(self) -> int:
+        return super().memory_bytes() + self.posting_rows.nbytes + self.name_key_offsets.nbytes + len(self.name_key_blob)
+
+    def describe(self) -> dict:
+        out = super().describe()
+        out.update(
+            {
+                "jaccard": self.jaccard_threshold,
+                "n_target_rows": int(self.n_rows),
+                "name_key_blob": human_bytes(len(self.name_key_blob)),
+            }
+        )
+        return out
+
+    # -- build --------------------------------------------------------------
+    @classmethod
+    def build(
+        cls,
+        chunks: Iterable[pd.DataFrame] | Callable[[], Iterator[pd.DataFrame]],
+        source: str,
+        prefix: str,
+        key_field: str = NAME_KEY,
+        log: Optional[logging.Logger] = None,
+        total_rows: Optional[int] = None,
+        df_cap: int = 1000,
+        rarest_k: int = 5,
+        jaccard: float = 0.3,
+    ) -> "CharNgramIndex":
+        """Build the trigram index plus the target ``name_key`` store, in two passes.
+
+        Pass one counts trigram document frequency over the target corpus. Pass two
+        selects each entity's rarest ``rarest_k`` eligible trigrams, appends its
+        postings - carrying the table row so verification can find the name - and
+        streams the ``name_key`` values into one blob in table order.
+
+        The blob stays in table order rather than being permuted into posting order:
+        permuting millions of variable-length strings at build time would cost more
+        than the ``posting_rows`` indirection it would save.
+        """
+        log = log or logger
+        factory = _chunk_factory(chunks)
+        label = f"[{source}] char"
+
+        df = _count_code_df(
+            factory(),
+            key_field,
+            lambda texts: _trigram_codes_for_list(texts),
+            log,
+            label,
+            "trigrams",
+        )
+
+        parts_keys: list[np.ndarray] = []
+        parts_codes: list[np.ndarray] = []
+        parts_rows: list[np.ndarray] = []
+        blob = bytearray()
+        offsets = [0]
+        rows = 0
+        indexed_entities = 0
+        rows_without_key = 0
+
+        for frame in factory():
+            texts = frame[key_field].to_numpy(dtype=object)
+            entity_codes = encode_entity_ids(frame["entity_id"])
+            codes, owners = _trigram_codes_for_list(texts)
+            row_base = rows
+            rows += len(texts)
+
+            for text in texts:
+                blob.extend(text.encode("utf-8"))
+                offsets.append(len(blob))
+
+            if codes.size == 0:
+                rows_without_key += len(texts)
+                continue
+
+            dfs = df.lookup(codes)
+            selected = _rarest_keep_mask(owners, codes, dfs, df_cap, rarest_k)
+            if not selected.any():
+                rows_without_key += len(texts)
+                continue
+
+            survivors = np.unique(owners[selected])
+            indexed_entities += int(survivors.size)
+            rows_without_key += len(texts) - int(survivors.size)
+
+            parts_keys.append(codes[selected])
+            parts_codes.append(entity_codes[owners[selected]])
+            parts_rows.append(owners[selected] + row_base)
+
+        name_key_offsets = np.asarray(offsets, dtype=np.int64)
+        if not parts_keys:
+            log.warning("%s: no indexable trigrams; the df cap of %s removed every key", label, df_cap)
+            index = cls(
+                source=source,
+                prefix=prefix,
+                key_field=key_field,
+                keys=_EMPTY_INT64,
+                key_df=np.empty(0, dtype=np.int32),
+                postings_offsets=np.zeros(1, dtype=np.int64),
+                postings=_EMPTY_INT64,
+                df_cap=df_cap,
+                rarest_k=rarest_k,
+                df=df,
+                posting_rows=_EMPTY_INT64,
+                name_key_offsets=name_key_offsets,
+                name_key_blob=bytes(blob),
+                jaccard_threshold=jaccard,
+            )
+            return index
+
+        all_keys = np.concatenate(parts_keys)
+        all_postings = np.concatenate(parts_codes)
+        all_rows = np.concatenate(parts_rows)
+        order = np.lexsort((all_postings, all_keys))
+        all_keys, all_postings, all_rows = all_keys[order], all_postings[order], all_rows[order]
+        starts = np.flatnonzero(np.concatenate(([True], all_keys[1:] != all_keys[:-1])))
+        postings_offsets = np.concatenate((starts, [len(all_keys)]))
+
+        index = cls(
+            source=source,
+            prefix=prefix,
+            key_field=key_field,
+            keys=all_keys[starts],
+            key_df=df.lookup(all_keys[starts]).astype(np.int32),
+            postings_offsets=postings_offsets,
+            postings=all_postings,
+            df_cap=df_cap,
+            rarest_k=rarest_k,
+            df=df,
+            n_entities_indexed=indexed_entities,
+            n_rows_without_key=rows_without_key,
+            posting_rows=all_rows,
+            name_key_offsets=name_key_offsets,
+            name_key_blob=bytes(blob),
+            jaccard_threshold=jaccard,
+        )
+        log.info(
+            "%s: trigram index built (%s, J>=%s); %s entities indexed, %s rows contributed "
+            "no surviving key",
+            label,
+            f"{index.n_keys:,} keys / {index.n_postings:,} postings",
+            jaccard,
+            f"{indexed_entities:,}",
+            f"{rows_without_key:,}",
+        )
+        return index
+
+    # -- query --------------------------------------------------------------
+    def query(self, values: Sequence[str] | pd.Series) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        """Char candidates for one S1 chunk, with each pair's Jaccard.
+
+        Retrieve by shared rare trigram, deduplicate to unique pairs, verify every
+        pair against the target ``name_key``, then apply the threshold. Deduplicating
+        *before* verifying is deliberate: verification is the expensive part, and the
+        Jaccard is a function of the pair, so a pair retrieved through three shared
+        trigrams needs one evaluation rather than three.
+        """
+        texts = _as_object_array(values)
+        if texts.size == 0:
+            return _EMPTY_INT64, {}
+        codes, owners = _trigram_codes_for_list(texts)
+        if codes.size == 0:
+            return _EMPTY_INT64, {}
+
+        dfs = self.df.lookup(codes)
+        take = self._query_keys(codes, owners, dfs)
+        if take.size == 0:
+            return _EMPTY_INT64, {}
+
+        positions, counts = self.lookup_many(codes[take])
+        if int(counts.sum()) == 0:
+            return _EMPTY_INT64, {}
+        key_owner, flat = self._flat_indices(positions, counts)
+        # ``key_owner`` indexes the rarest-K subset, so it is mapped back to the
+        # original query row before packing.
+        packed = pack_pairs(owners[take][key_owner], self.postings[flat])
+        unique_packed, first = np.unique(packed, return_index=True)
+        s1_positions, _ = unpack_pairs(unique_packed)
+        target_rows = self.posting_rows[flat[first]]
+
+        similarities = self._verify(s1_positions, target_rows, texts)
+        keep = similarities >= self.jaccard_threshold
+        if not keep.any():
+            return _EMPTY_INT64, {"char_jaccard": np.empty(0, dtype=np.float64)}
+        return unique_packed[keep], {"char_jaccard": similarities[keep]}
+
+    def _verify(self, s1_positions: np.ndarray, target_rows: np.ndarray, texts: np.ndarray) -> np.ndarray:
+        """Trigram Jaccard for every pair, sharded, consumed in submission order.
+
+        Chunks are consumed strictly in submission order, so the similarity array is a
+        deterministic function of the input regardless of worker count - which is what
+        lets ``compute.num_workers`` be a pure performance knob here.
+        """
+        total = len(target_rows)
+        out = np.zeros(total, dtype=np.float64)
+        if total == 0:
+            return out
+        chunk_pairs = max(1, int(self.verify_chunk_pairs))
+        spans = [(start, min(start + chunk_pairs, total)) for start in range(0, total, chunk_pairs)]
+
+        def payload_for(start: int, stop: int) -> tuple[list[str], np.ndarray]:
+            return [texts[int(position)] for position in s1_positions[start:stop]], target_rows[start:stop]
+
+        if self.workers <= 1 or self.directory is None:
+            for start, stop in spans:
+                out[start:stop] = self._verify_sequential(
+                    s1_positions[start:stop], target_rows[start:stop], texts
+                )
+            return out
+
+        pending: deque = deque()
+        window = max(2, self.workers * 4)
+        with ProcessPoolExecutor(
+            max_workers=self.workers,
+            initializer=_char_verify_init,
+            initargs=(str(self.directory),),
+        ) as pool:
+            for start, stop in spans:
+                pending.append((start, stop, pool.submit(_char_verify_chunk, payload_for(start, stop))))
+                if len(pending) >= window:
+                    begin, end, future = pending.popleft()
+                    out[begin:end] = future.result()
+            while pending:
+                begin, end, future = pending.popleft()
+                out[begin:end] = future.result()
+        return out
+
+    def _verify_sequential(
+        self, s1_positions: np.ndarray, target_rows: np.ndarray, texts: np.ndarray
+    ) -> np.ndarray:
+        """One shard of Jaccard values, off the in-memory blob.
+
+        The single-worker path, and the only path available to an index that was built
+        in memory and never saved - a process pool cannot be told where to find the
+        target names if there is no directory. Uses the same :func:`_trigram_jaccard`
+        as the worker path, so the two cannot diverge.
+        """
+        out = np.zeros(len(target_rows), dtype=np.float64)
+        offsets, blob = self.name_key_offsets, self.name_key_blob
+        for index in range(len(target_rows)):
+            row = int(target_rows[index])
+            if row < 0:
+                continue
+            out[index] = _trigram_jaccard(
+                texts[int(s1_positions[index])], _target_name_at(offsets, blob, row)
+            )
+        return out
+
+    # -- persistence --------------------------------------------------------
+    def save(self, directory: str | os.PathLike) -> Path:
+        directory = ensure_dir(directory)
+        self._save_common(Path(directory))
+        np.save(Path(directory) / POSTING_ROWS_FILE, self.posting_rows)
+        np.save(Path(directory) / NAME_KEY_OFFSETS_FILE, self.name_key_offsets)
+        with open(Path(directory) / NAME_KEY_BLOB_FILE, "wb") as handle:
+            handle.write(self.name_key_blob)
+        self.df.save(directory)
+        write_json(
+            Path(directory) / META_FILE,
+            self._common_meta(
+                BLOCKER_CHAR_NGRAM,
+                {
+                    "posting_rows": POSTING_ROWS_FILE,
+                    "name_key_offsets": NAME_KEY_OFFSETS_FILE,
+                    "name_key_blob": NAME_KEY_BLOB_FILE,
+                    "df_codes": DF_CODES_FILE,
+                    "df_values": DF_VALUES_FILE,
+                },
+                {"jaccard": self.jaccard_threshold, "n_target_rows": int(self.n_rows)},
+            ),
+        )
+        self.directory = Path(directory)
+        return Path(directory)
+
+    @classmethod
+    def load(
+        cls,
+        directory: str | os.PathLike,
+        log: Optional[logging.Logger] = None,
+        workers: int = 1,
+    ) -> "CharNgramIndex":
+        directory = Path(directory)
+        meta = _read_index_meta(directory, BLOCKER_CHAR_NGRAM)
+        keys, key_df, postings_offsets, postings = cls._load_common(directory)
+        with open(directory / NAME_KEY_BLOB_FILE, "rb") as handle:
+            blob = handle.read()
+        index = cls(
+            source=meta["source"],
+            prefix=meta["prefix"],
+            key_field=meta["key_field"],
+            keys=keys,
+            key_df=key_df,
+            postings_offsets=postings_offsets,
+            postings=postings,
+            df_cap=int(meta["df_cap"]),
+            rarest_k=int(meta["rarest_k"]),
+            n_entities_indexed=int(meta.get("n_entities_indexed", 0)),
+            n_rows_without_key=int(meta.get("n_rows_without_key", 0)),
+            posting_rows=np.load(directory / POSTING_ROWS_FILE),
+            name_key_offsets=np.load(directory / NAME_KEY_OFFSETS_FILE),
+            name_key_blob=blob,
+            jaccard_threshold=float(meta["jaccard"]),
+            workers=workers,
+            df=DocumentFrequency.load(directory),
+            directory=directory,
+        )
+        if log:
+            log.info("loaded index %s: %s", directory.name, index.describe())
+        return index
+
+
 def _not_implemented(blocker: str):
     def _builder(*args: Any, **kwargs: Any):
         raise NotImplementedError(
             f"blocker {blocker!r} is planned but not implemented yet.\n"
-            f"  Milestone 1 implements {BLOCKER_EXACT_NAME!r} only.\n"
-            f"  See README 'Roadmap' for the incremental plan."
+            f"  Implemented blockers: {UNION_BLOCKERS}.\n"
+            f"  See README 'Blocking' for the plan."
         )
 
     return _builder
 
 
+def _build_exact_name(
+    chunks: Iterable[pd.DataFrame] | Callable[[], Iterator[pd.DataFrame]],
+    source: str,
+    prefix: str,
+    key_field: str,
+    log: Optional[logging.Logger],
+    total_rows: Optional[int],
+    **_settings: Any,
+) -> ExactNameIndex:
+    """Adapter giving the exact-name build the uniform builder signature.
+
+    ``ExactNameIndex.build`` takes no cell settings and needs one pass, so it keeps
+    its own signature; the registry entry is this thin wrapper rather than adding
+    unused parameters to a class the calibration scripts also use. ``**_settings``
+    absorbs the (empty) resolved cell so every registry entry is called the same way.
+    """
+    return ExactNameIndex.build(
+        _chunk_factory(chunks)(),
+        source=source,
+        prefix=prefix,
+        key_field=key_field,
+        log=log,
+        total_rows=total_rows,
+    )
+
+
+# Every entry takes ``(chunks, source, prefix, key_field, log, total_rows, settings)``,
+# where ``chunks`` is a zero-argument factory so a multi-pass builder can read the
+# table twice. The settings dict is the blocker's resolved cell
+# (:func:`resolve_blocker_settings`), empty for the blockers that take none.
 INDEX_BUILDERS = {
-    BLOCKER_EXACT_NAME: ExactNameIndex.build,
-    BLOCKER_TOKEN: _not_implemented(BLOCKER_TOKEN),
-    BLOCKER_CHAR_NGRAM: _not_implemented(BLOCKER_CHAR_NGRAM),
+    BLOCKER_EXACT_NAME: _build_exact_name,
+    BLOCKER_TOKEN: TokenIndex.build,
+    BLOCKER_CHAR_NGRAM: CharNgramIndex.build,
     BLOCKER_DENSE: _not_implemented(BLOCKER_DENSE),
+}
+
+# Loader per blocker. Kept explicit rather than derived from INDEX_BUILDERS because
+# the char index takes a runtime worker count the others do not.
+INDEX_LOADERS: dict[str, Callable[..., MultiKeyIndex]] = {
+    BLOCKER_EXACT_NAME: ExactNameIndex.load,
+    BLOCKER_TOKEN: TokenIndex.load,
+    BLOCKER_CHAR_NGRAM: CharNgramIndex.load,
 }
 
 
@@ -618,7 +2213,7 @@ def build_index(
     log: Optional[logging.Logger] = None,
     overwrite: bool = False,
     total_rows: Optional[int] = None,
-) -> ExactNameIndex:
+) -> MultiKeyIndex:
     """Build (and persist) one blocker index for one target source.
 
     Args:
@@ -632,6 +2227,9 @@ def build_index(
 
     Returns:
         The built index (also written to ``config['resolved']['index_dir']``).
+
+    Raises:
+        ValueError: on an unknown blocker, or a blocker setting the config got wrong.
     """
     if source not in TARGET_SOURCES:
         raise ValueError(f"indexes are for target sources {TARGET_SOURCES}, got {source!r}")
@@ -639,6 +2237,7 @@ def build_index(
         raise ValueError(f"unknown blocker {blocker!r}; expected one of {KNOWN_BLOCKERS}")
 
     log = log or logger
+    settings = resolve_blocker_settings(config, blocker)
     directory = index_dir_for(config, split, source, blocker)
 
     if not overwrite:
@@ -647,19 +2246,25 @@ def build_index(
             existing = read_json(meta_path).get("index_version")
             if existing == INDEX_VERSION:
                 log.info("index already exists at %s - loading instead of rebuilding", directory)
-                return ExactNameIndex.load(directory, log=log)
+                return _load_index_at(directory, blocker, log=log)
             log.warning("index at %s is version %s, rebuilding", directory, existing)
 
     key_field = _key_field_for(config, blocker)
+    if key_field not in _prepared_columns(config, split, source):
+        raise ValueError(
+            f"blocker {blocker!r} keys on {key_field!r}, which the prepared {source} table does "
+            f"not have; rerun scripts/prepare_data.py"
+        )
     path = prepared_path(config, split, source)
     require_file(path, hint="Run: python scripts/prepare_data.py")
 
     log.info(
-        "building %s index | source=%s split=%s key_field=%s limit=%s",
+        "building %s index | source=%s split=%s key_field=%s settings=%s limit=%s",
         blocker,
         source,
         split,
         key_field,
+        settings or "none",
         limit or "none",
     )
 
@@ -679,16 +2284,45 @@ def build_index(
 
     builder = INDEX_BUILDERS[blocker]
     index = builder(
-        _chunks(),
+        _chunks,
         source=source,
         prefix=SOURCE_PREFIX[source],
         key_field=key_field,
         log=log,
         total_rows=total_rows,
+        **settings,
     )
     index.save(directory)
     log.info("saved index to %s", directory)
     return index
+
+
+def _prepared_columns(config: dict, split: str, source: str) -> set[str]:
+    """Column names of a prepared table, from its header only.
+
+    The header costs one line; a full read of a 500MB table to validate a column name
+    would not be worth it.
+    """
+    from .data_loader import iter_tsv
+
+    try:
+        for chunk in iter_tsv(prepared_path(config, split, source), chunksize=1):
+            return set(chunk.columns)
+    except FileNotFoundError:
+        return set()
+    return set()
+
+
+def _load_index_at(directory: Path, blocker: str, log: Optional[logging.Logger] = None, workers: int = 1):
+    """Load a persisted index of any implemented blocker from its directory."""
+    loader = INDEX_LOADERS.get(blocker)
+    if loader is None:
+        raise NotImplementedError(
+            f"blocker {blocker!r} has no index implementation; implemented: {UNION_BLOCKERS}"
+        )
+    if blocker == BLOCKER_CHAR_NGRAM:
+        return CharNgramIndex.load(directory, log=log, workers=workers)
+    return loader(directory, log=log)
 
 
 def load_index(
@@ -697,9 +2331,16 @@ def load_index(
     source: str,
     blocker: str = BLOCKER_EXACT_NAME,
     log: Optional[logging.Logger] = None,
-) -> ExactNameIndex:
-    """Load a persisted index, with a clear error if it is missing."""
-    return ExactNameIndex.load(index_dir_for(config, split, source, blocker), log=log)
+    workers: int = 1,
+) -> MultiKeyIndex:
+    """Load a persisted index, with a clear error if it is missing.
+
+    Args:
+        workers: verification processes for the char blocker. Ignored by the others,
+            which have no per-pair work to shard. Purely a performance knob: results
+            do not depend on it.
+    """
+    return _load_index_at(index_dir_for(config, split, source, blocker), blocker, log=log, workers=workers)
 
 
 # ---------------------------------------------------------------------------
@@ -722,56 +2363,117 @@ def unpack_pairs(packed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return s1_positions, entity_codes
 
 
+def _positions_of(unique_packed: np.ndarray, packed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Where each value of ``packed`` sits in the sorted ``unique_packed``.
+
+    ``searchsorted`` + equality: a set membership test without building python sets
+    over millions of elements.
+
+    Returns:
+        ``(positions, present)`` - both aligned to ``packed``; ``positions`` is
+        meaningless where ``present`` is false.
+    """
+    positions = np.searchsorted(unique_packed, packed)
+    np.clip(positions, 0, len(unique_packed) - 1, out=positions)
+    present = unique_packed[positions] == packed
+    return positions, present
+
+
 def union_blockers(
     blocker_pairs: dict[str, np.ndarray],
+    blocker_evidence: Optional[dict[str, dict[str, np.ndarray]]] = None,
     log: Optional[logging.Logger] = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
     """Union candidate pairs from several blockers, deduplicating per S1.
+
+    Unions, never intersects: a pair proposed by any blocker is a candidate. The union
+    is a single ``np.unique`` over packed integers, which deduplicates and sorts by
+    (s1_position, entity_code) in the same call.
 
     Args:
         blocker_pairs: ``{blocker_name: packed_pairs}`` exactly as produced by
-            :func:`pack_pairs`. Every array refers to the same S1 positions.
+            :func:`pack_pairs`, or by any index's ``query``. Every array refers to the
+            same S1 positions, and each is already deduplicated within its blocker.
+        blocker_evidence: ``{blocker_name: {column: values}}`` with each value array
+            aligned to that blocker's ``packed_pairs``. Carried through to the output;
+            it never changes which pairs are emitted.
         log: logger.
 
     Returns:
-        ``(s1_positions, entity_codes, blockers_per_pair)``, sorted by
+        ``(s1_positions, entity_codes, blockers_per_pair, evidence)``, sorted by
         (s1_position, entity_code). ``blockers_per_pair`` is an object array of
-        comma-joined blocker names, so provenance survives the union - which is
-        what later lets us audit which blocker is actually earning its keep.
+        comma-joined blocker names in :data:`UNION_BLOCKERS` order, so provenance
+        survives the union - which is what lets us audit which blocker earned its keep
+        and is what the matcher will use to tell a char-only pair from an exact one.
+        ``evidence`` is ``{column: float64 array}`` aligned to the output. A blocker
+        that proposed no pair contributes no column at all; a blocker that proposed
+        some pairs contributes a column that is NaN wherever it did not propose *this*
+        pair, which is the normal case for a union - an exact-name pair has no char
+        Jaccard. Callers writing a fixed schema should therefore read a column with
+        ``evidence.get(column)`` and render the absence as blank.
     """
     non_empty = {name: arr for name, arr in blocker_pairs.items() if len(arr)}
     if not non_empty:
-        empty_packed = np.empty(0, dtype=np.int64)
-        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64), np.empty(0, dtype=object)
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty, np.empty(0, dtype=object), {}
 
     all_packed = np.concatenate(list(non_empty.values()))
     unique_packed = np.unique(all_packed)
     s1_positions, entity_codes = unpack_pairs(unique_packed)
+    n_pairs = len(unique_packed)
 
-    if len(non_empty) == 1:
-        only_name = next(iter(non_empty))
-        provenance = np.full(len(unique_packed), only_name, dtype=object)
-    else:
-        provenance = np.full(len(unique_packed), "", dtype=object)
-        for name, packed in non_empty.items():
-            # searchsorted + equality: a set membership test without building
-            # python sets (millions of elements).
-            idx = np.searchsorted(unique_packed, packed)
-            np.clip(idx, 0, len(unique_packed) - 1, out=idx)
-            present = unique_packed[idx] == packed
-            mask = np.zeros(len(unique_packed), dtype=bool)
-            mask[idx[present]] = True
-            provenance[mask] = np.where(
-                provenance[mask] == "", name, np.char.add(provenance[mask].astype(str), f",{name}")
+    # Canonical, fixed order rather than dict-insertion order, so the provenance
+    # string for a pair does not depend on how the caller built its dict. Names may
+    # be bare blocker names or ``source:blocker`` labels; the blocker part decides.
+    def _rank(name: str) -> tuple[int, str]:
+        blocker = name.rsplit(":", 1)[-1]
+        return (UNION_BLOCKERS.index(blocker) if blocker in UNION_BLOCKERS else len(UNION_BLOCKERS), name)
+
+    names = sorted(non_empty, key=_rank)
+
+    evidence_out: dict[str, np.ndarray] = {}
+    for name in names:
+        for column in (blocker_evidence or {}).get(name, {}) or {}:
+            evidence_out.setdefault(column, np.full(n_pairs, np.inf, dtype=np.float64))
+
+    provenance = np.full(n_pairs, "", dtype=object)
+    if len(names) == 1:
+        provenance[:] = names[0]
+    for name in names:
+        packed = non_empty[name]
+        positions, present = _positions_of(unique_packed, packed)
+        if not present.all():
+            positions = positions[present]
+        if len(names) > 1:
+            selected = provenance[positions]
+            provenance[positions] = np.where(
+                selected == "", name, np.char.add(selected.astype(str), f",{name}")
             )
+        for column, values in ((blocker_evidence or {}).get(name, {}) or {}).items():
+            values = np.asarray(values, dtype=np.float64)
+            if values.shape[0] != present.shape[0]:
+                raise ValueError(
+                    f"evidence {column!r} for blocker {name!r} has {values.shape[0]} values "
+                    f"but {present.shape[0]} pairs"
+                )
+            target = evidence_out[column]
+            if not present.all():
+                # Rare, and only possible if a caller handed over a non-unique array:
+                # fall back to the buffered path so duplicates cannot be dropped.
+                positions, values = _positions_of(unique_packed, packed)[0][present], values[present]
+            if positions.size:
+                np.minimum.at(target, positions, values)
+
+    for column, target in evidence_out.items():
+        target[np.isinf(target)] = np.nan
 
     if log:
         log.info(
             "union: %s blocker(s) -> %s unique pairs",
             len(non_empty),
-            f"{len(unique_packed):,}",
+            f"{n_pairs:,}",
         )
-    return s1_positions, entity_codes, provenance
+    return s1_positions, entity_codes, provenance, evidence_out
 
 
 def truncate_per_group(

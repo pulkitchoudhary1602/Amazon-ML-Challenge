@@ -1110,16 +1110,43 @@ def test_markdown_and_csv_are_written_and_consistent():
 
 
 def test_script_does_not_touch_the_config_or_enable_blockers():
-    """Step 0 must leave ``configs/config.yaml`` and its blocking flags alone."""
+    """Step 0 must leave ``configs/config.yaml`` byte-for-byte alone.
+
+    The calibration still runs volume-only and still mutates nothing: it is invoked
+    with its own fixture config, and this asserts the repository's own config is not
+    written to as a side effect.
+
+    The flag assertions used to require ``token``/``char_ngram`` to be *disabled*,
+    which was true while blocking was still being calibrated. The production blocker
+    integration then enabled them on purpose, so what is pinned here is the
+    provisional cell itself - a stray edit to these values would silently change the
+    blocker that was measured, which is the failure this test exists to catch.
+    """
+    config_path = REPO / "configs" / "config.yaml"
+    before = config_path.read_bytes()
+
     _report()
-    config = load_config(str(REPO / "configs" / "config.yaml"))
+
+    assert config_path.read_bytes() == before, "the calibration must not write config.yaml"
+    config = load_config(str(config_path))
     blocking = config["blocking"]
-    assert blocking["char_ngram"]["enabled"] is False
-    assert blocking["token"]["enabled"] is False
-    assert blocking["tfidf"]["enabled"] is False
-    assert blocking["dense"]["enabled"] is False
     assert blocking["exact_name"]["enabled"] is True
     assert blocking["exact_name"]["key"] == "name_norm"
+    assert blocking["token"] == {
+        "enabled": True,
+        "key": "name_norm",
+        "df_cap": 1000,
+        "rarest_k": 1,
+    }
+    assert blocking["char_ngram"] == {
+        "enabled": True,
+        "key": "name_key",
+        "df_cap": 1000,
+        "rarest_k": 5,
+        "jaccard": 0.3,
+    }
+    assert blocking["tfidf"]["enabled"] is False
+    assert blocking["dense"]["enabled"] is False
 
 
 def test_cli_rejects_bad_arguments():

@@ -133,6 +133,16 @@ blocking:
   # Each blocker is a candidate generator. The final candidate set is the UNION
   # over all enabled blockers. Blocking only proposes pairs; it never decides
   # whether a pair is a match.
+  #
+  # The configuration below is the PROVISIONAL production blocker: the cell that was
+  # measured end to end at pair recall 57.0123% / 336,056,756 candidates.
+  #   exact(name_norm)  UNION  token(name_norm, df<=1000, rarest 1)
+  #                            UNION  char(name_key, df<=1000, rarest 5, J>=0.3)
+  # A DF=5000 / rarest-K=1 token variant is still an INDEPENDENT BACKGROUND
+  # EXPERIMENT and is deliberately not wired in here.
+  #
+  # df_cap and rarest_k are not tuning knobs: changing them defines a different
+  # blocker than the one that was calibrated. See README "Blocking".
   exact_name:
     enabled: true
     # Which normalized field to key on:
@@ -140,18 +150,34 @@ blocking:
     #   name_key  -> "oreleesbarbershop"     (all separators removed)
     key: "name_norm"
 
-  # ---- Roadmap: implemented in later milestones, disabled for now ----
   token:
-    enabled: false
+    enabled: true
+    # name_norm, so the blocker sees the same token boundaries the corpus
+    # statistics were counted over.
+    key: "name_norm"
+    # A token is eligible only when 0 < df <= df_cap over the TARGET corpus, and
+    # each entity spends its rarest_k slots on its rarest eligible tokens.
+    df_cap: 1000
+    rarest_k: 1
+
   char_ngram:
-    enabled: false
+    enabled: true
+    # name_key, NOT name_norm: the char blocker's signal is defined on the
+    # separator-free form, and forcing it onto name_norm would be a different
+    # blocker than the one that was calibrated.
+    key: "name_key"
+    df_cap: 1000
+    rarest_k: 5
+    # Inclusive trigram Jaccard cut-off applied to every retrieved pair.
+    jaccard: 0.3
+
+  # ---- Roadmap: implemented in later milestones, disabled for now ----
   tfidf:
     enabled: false
   dense:
     enabled: false
 
   # Safety valve: cap candidates per (S1, source). 0 = unlimited.
-  # Exact-name blocking is naturally low-volume, so 0 is fine here.
   max_candidates_per_source: 0
 
 evaluation:
