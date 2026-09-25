@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -265,8 +266,295 @@ def describe_device(logger: Optional[logging.Logger] = None, config: Optional[di
 
 
 # ---------------------------------------------------------------------------
-# Stable hashing
+# Hardware detection
 # ---------------------------------------------------------------------------
+# Query used against nvidia-smi. ``nounits`` keeps the values numeric (MiB), so
+# the parse is a plain float() rather than a unit-aware regex.
+_NVIDIA_SMI_QUERY = "index,name,memory.total,memory.free"
+
+
+def detect_hardware() -> dict:
+    """Report CPUs, RAM, every GPU, and CUDA/torch status.
+
+    Torch alone is **not** a sufficient GPU detector: a CPU-only torch build (the
+    common case on a login node, and the case on a laptop with a usable GPU)
+    reports no CUDA even when ``nvidia-smi`` can enumerate devices. So GPUs come
+    from ``nvidia-smi`` first, and torch is used only to enrich or to fill in the
+    device list when the tool is unavailable. Nothing here is fatal: a machine
+    without nvidia-smi, without torch or without psutil still yields a report.
+
+    Returns:
+        A dict with ``cpu_logical``, ``cpu_physical``, ``ram_total``,
+        ``ram_available``, ``gpus`` (list of ``{index, name, memory_total,
+        memory_free}``, byte-valued, ``None`` where unknown), ``gpu_source``,
+        ``torch``, ``cuda_available`` and ``cuda_device_count``.
+    """
+    info: dict = {
+        "cpu_logical": os.cpu_count(),
+        "cpu_physical": None,
+        "ram_total": None,
+        "ram_available": None,
+        "gpus": [],
+        "gpu_source": "nvidia-smi",
+        "torch": None,
+        "cuda_available": False,
+        "cuda_device_count": 0,
+    }
+
+    if _psutil is not None:
+        try:
+            info["cpu_physical"] = _psutil.cpu_count(logical=False)
+        except Exception:  # pragma: no cover - psutil is best-effort here
+            pass
+        try:
+            memory = _psutil.virtual_memory()
+            info["ram_total"] = int(memory.total)
+            info["ram_available"] = int(memory.available)
+        except Exception:  # pragma: no cover
+            pass
+
+    info["gpus"] = _nvidia_smi_gpus()
+
+    try:
+        import torch
+
+        info["torch"] = torch.__version__
+        info["cuda_available"] = bool(torch.cuda.is_available())
+        if info["cuda_available"]:
+            info["cuda_device_count"] = int(torch.cuda.device_count())
+            if not info["gpus"]:
+                # No nvidia-smi: fall back to what torch can see.
+                info["gpu_source"] = "torch"
+                for index in range(info["cuda_device_count"]):
+                    try:
+                        properties = torch.cuda.get_device_properties(index)
+                        info["gpus"].append(
+                            {
+                                "index": index,
+                                "name": torch.cuda.get_device_name(index),
+                                "memory_total": int(properties.total_memory),
+                                "memory_free": None,
+                            }
+                        )
+                    except Exception:  # pragma: no cover - defensive
+                        info["gpus"].append(
+                            {"index": index, "name": "unknown", "memory_total": None, "memory_free": None}
+                        )
+    except ImportError:
+        pass
+
+    return info
+
+
+def _nvidia_smi_gpus() -> list[dict]:
+    """Enumerate GPUs via ``nvidia-smi``. Empty list when it is absent or fails."""
+    try:
+        completed = subprocess.run(
+            ["nvidia-smi", f"--query-gpu={_NVIDIA_SMI_QUERY}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    return parse_nvidia_smi(completed.stdout)
+
+
+def parse_nvidia_smi(text: str) -> list[dict]:
+    """Parse ``nvidia-smi --query-gpu=... --format=csv,noheader,nounits`` output.
+
+    Malformed lines are skipped rather than raising, and unreadable memory
+    figures (``[N/A]`` on some virtualised drivers) leave the GPU in the list
+    with ``None`` memory instead of dropping it - the device still exists and
+    still matters for the report.
+    """
+    gpus: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            index = int(parts[0])
+        except ValueError:
+            continue
+        gpu = {"index": index, "name": parts[1], "memory_total": None, "memory_free": None}
+        if len(parts) >= 4:
+            gpu["memory_total"] = _mib_to_bytes(parts[2])
+            gpu["memory_free"] = _mib_to_bytes(parts[3])
+        gpus.append(gpu)
+    return gpus
+
+
+def _mib_to_bytes(text: str) -> Optional[int]:
+    """Convert an nvidia-smi MiB figure to bytes; ``None`` when unreadable."""
+    try:
+        return int(float(text)) * 1024 * 1024
+    except (TypeError, ValueError):
+        return None
+
+
+def format_hardware_report(info: dict) -> str:
+    """Render :func:`detect_hardware` as a short multi-line human summary."""
+    physical = info.get("cpu_physical")
+    logical = info.get("cpu_logical")
+    if physical and logical and physical != logical:
+        cpu = f"{physical} physical / {logical} logical"
+    else:
+        cpu = f"{physical or logical or 'unknown'} logical"
+    lines = [f"cpu: {cpu}"]
+
+    if info.get("ram_total"):
+        available = (
+            f", {human_bytes(info['ram_available'])} available" if info.get("ram_available") else ""
+        )
+        lines.append(f"ram: {human_bytes(info['ram_total'])}{available}")
+
+    gpus = info.get("gpus") or []
+    if not gpus:
+        lines.append("gpus: none detected")
+    for gpu in gpus:
+        memory = human_bytes(gpu["memory_total"]) if gpu.get("memory_total") else "vram unknown"
+        free = f", {human_bytes(gpu['memory_free'])} free" if gpu.get("memory_free") else ""
+        lines.append(f"gpu {gpu['index']}: {gpu['name']} ({memory}{free}) [{info.get('gpu_source', '?')}]")
+
+    torch_version = info.get("torch") or "not installed"
+    if info.get("cuda_available"):
+        lines.append(
+            f"cuda: yes (torch {torch_version}, {info.get('cuda_device_count', 0)} device(s) usable by torch)"
+        )
+    elif gpus:
+        lines.append(f"cuda: no (torch {torch_version}) - GPU(s) present but not usable by torch")
+    else:
+        lines.append(f"cuda: no (torch {torch_version})")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Worker resolution
+# ---------------------------------------------------------------------------
+def auto_worker_count() -> int:
+    """Default worker count when none is configured: physical cores, else logical."""
+    physical = _physical_cpu_count()
+    if physical:
+        return max(1, int(physical))
+    return max(1, os.cpu_count() or 1)
+
+
+def _physical_cpu_count() -> Optional[int]:
+    """Physical core count, or ``None`` when psutil cannot tell us."""
+    if _psutil is None:
+        return None
+    try:
+        return _psutil.cpu_count(logical=False)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def resolve_workers(
+    requested: int = 0,
+    configured: int = 0,
+    n_chunks: int = 0,
+    logger: Optional[logging.Logger] = None,
+    label: str = "workers",
+) -> int:
+    """Resolve the CPU worker count: CLI > config > auto, clamped to the work available.
+
+    The auto default is the **physical** core count. This stage is bound by python
+    string/token work and memory bandwidth rather than by floating-point units, so
+    hyperthread siblings mostly add contention; and the previous hard cap of 8
+    silently threw away most of a large HPC node.
+
+    Args:
+        requested: value from the CLI (``0`` means "not specified").
+        configured: value from ``compute.num_workers`` (``0`` means auto).
+        n_chunks: number of work chunks; more workers than chunks is wasted.
+        logger: optional logger, for the one-line explanation of the choice.
+        label: label used in the log line.
+
+    Returns:
+        A worker count of at least 1, never above the chunk count.
+    """
+    total = auto_worker_count()
+    workers = int(requested or configured or total)
+    workers = max(1, min(workers, max(int(n_chunks), 1)))
+    if logger:
+        logger.info(
+            "%s: %s (logical cpu=%s, physical cpu=%s, chunks=%s)",
+            label,
+            fmt_int(workers),
+            fmt_int(os.cpu_count() or 0),
+            fmt_int(_physical_cpu_count() or 0),
+            fmt_int(n_chunks),
+        )
+    return workers
+
+
+def plan_inflight_window(
+    workers: int,
+    chunk_pairs: int,
+    bytes_per_pair: int,
+    budget_bytes: int,
+    logger: Optional[logging.Logger] = None,
+    label: str = "chunks",
+) -> tuple[int, int]:
+    """Bound in-flight chunk payloads so a big worker count cannot exhaust RAM.
+
+    A process pool keeps ``workers * 4`` chunks queued to stay fed, and each queued
+    chunk holds its pair strings as python objects. At the core counts worth using
+    on a large node that transient payload - not the report arrays - is what
+    decides peak RSS, so it is sized against a real budget instead of a bare
+    multiplier. When the budget does not fit, the payload is reduced and the
+    adjustment is logged; the run continues rather than dying.
+
+    Args:
+        workers: number of worker processes.
+        chunk_pairs: pairs per chunk as requested.
+        bytes_per_pair: estimated payload bytes for one pair (all six fields).
+        budget_bytes: RAM to spend on queued payloads.
+        logger: optional logger, for the adjustment message.
+        label: label used in the log line.
+
+    Returns:
+        ``(window, chunk_pairs)`` - the in-flight chunk limit and the possibly
+        reduced chunk size. Both are safe to use as-is.
+    """
+    target_window = max(2, int(workers) * 4)
+    bytes_per_pair = max(1, int(bytes_per_pair))
+    chunk_pairs = max(1, int(chunk_pairs))
+
+    requested_pairs = chunk_pairs
+    estimate = chunk_pairs * bytes_per_pair
+    if target_window * estimate > budget_bytes:
+        # Reduce the payload first: it lowers peak memory and keeps the pool fed
+        # with the same number of in-flight slots, which is the cheap fix.
+        affordable_pairs = max(1, budget_bytes // (target_window * bytes_per_pair))
+        chunk_pairs = min(chunk_pairs, affordable_pairs)
+        estimate = chunk_pairs * bytes_per_pair
+
+    affordable_window = max(1, budget_bytes // estimate)
+    window = max(2, min(target_window, affordable_window))
+
+    if logger and (chunk_pairs != requested_pairs or window != target_window):
+        logger.info(
+            "%s: payload bounded by RAM budget - chunk_pairs %s -> %s, in-flight window %s -> %s "
+            "(est %s/pair, budget %s)",
+            label,
+            fmt_int(requested_pairs),
+            fmt_int(chunk_pairs),
+            fmt_int(target_window),
+            fmt_int(window),
+            human_bytes(bytes_per_pair),
+            human_bytes(budget_bytes),
+        )
+    return window, chunk_pairs
+
+
 def stable_hash64(values: str | Sequence[str]) -> np.ndarray | int:
     """Hash strings to 64-bit unsigned ints.
 
@@ -322,12 +610,44 @@ def nbytes_of(*arrays: np.ndarray) -> str:
 
 def log_memory(logger: logging.Logger, label: str = "") -> Optional[str]:
     """Log current RSS if psutil is available. Returns the formatted string."""
-    if _psutil is None:
+    rss = current_rss_bytes()
+    if rss is None:
         return None
-    rss = _psutil.Process(os.getpid()).memory_info().rss
     text = human_bytes(rss)
     logger.info("RSS%s: %s", f" ({label})" if label else "", text)
     return text
+
+
+def current_rss_bytes() -> Optional[int]:
+    """This process's current RSS in bytes, or ``None`` without psutil."""
+    if _psutil is None:
+        return None
+    try:
+        return int(_psutil.Process(os.getpid()).memory_info().rss)
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
+def peak_rss_bytes() -> Optional[int]:
+    """This process's peak RSS in bytes, or ``None`` when it cannot be determined.
+
+    ``resource.getrusage`` reports the high-water mark, which is the number that
+    matters for sizing a run rather than the instantaneous value. Returns ``None``
+    on platforms where it is unavailable or meaningless (Windows) instead of a
+    misleading zero.
+    """
+    try:
+        import resource
+    except ImportError:
+        return None
+    try:
+        usage = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    if not usage:
+        return None
+    # Linux reports kibibytes; macOS reports bytes.
+    return usage if sys.platform == "darwin" else usage * 1024
 
 
 # ---------------------------------------------------------------------------

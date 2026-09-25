@@ -157,6 +157,7 @@ code takes the GPU when one is present and falls back to CPU otherwise.
 | Candidate union / dedupe | **CPU** | Chunked per S1, so per-chunk volume is small; GPU transfer overhead would dominate |
 | Token / char n-gram blocking | **CPU** | Hash and posting arithmetic |
 | Lexical pair features | **CPU** (multiprocess) | `rapidfuzz` is C++ and parallelizes across cores; no GPU edit-distance path worth using |
+| Phase 0.2-0.5 blocking statistics | **CPU** (multiprocess) | Per-pair `set`/`Counter` work over 7.6M pairs. Measured: encoding the trigrams a GPU kernel would need costs ~10 µs/string against a 5.4 µs whole-pair CPU budget, and vectorized NumPy came in at 0.1x the plain Python loop - so the accelerator starts behind before it does any work |
 | GBDT training | **CPU by default** | For ~20 features the GPU histogram path often loses to a well-threaded CPU build — benchmark `device=cuda` before enabling |
 | **Embedding generation** | **GPU when available** | ~12.6M texts, one-time, embarrassingly parallel |
 | **Dense retrieval / FAISS** | **GPU when available** | Exact search at this scale is GPU-friendly; needs the index in VRAM (fp16 for 16GB cards) |
@@ -165,6 +166,23 @@ code takes the GPU when one is present and falls back to CPU otherwise.
 
 The CPU rows are measurement-driven decisions, not limitations. None of those
 stages should grow a GPU path without a benchmark showing it actually wins.
+`scripts/benchmark_phase0.py` exists to hold that claim to account: it times the
+reference implementation, a flat-batched NumPy arm and a CUDA arm on real pairs,
+**checks every arm against the reference before reporting its time**, and sweeps
+worker and chunk sizes. Run it before changing the compute policy.
+
+### Workers and memory
+
+`compute.num_workers: 0` means auto: the **physical** core count, clamped to the
+number of chunks. Physical rather than logical because this work is python
+string/token bound, so hyperthread siblings mostly add contention. There is no
+low ceiling - a wide node is used.
+
+The pair pass feeds a process pool from a bounded sliding window, and the queued
+chunks hold their pair strings as python objects. `compute.payload_budget_bytes`
+(`null` = a quarter of currently-available RAM) caps that queue: when it does not
+fit, the chunk size is reduced first and the window second, and the adjustment is
+logged. A too-large default batch slows a run down; it never kills one.
 
 Report what the current machine resolves to:
 
@@ -220,6 +238,30 @@ Stage-by-stage reference:
 
 `prepare_data.py` also writes `{split}_source1_norm.tsv` with a `split` column
 (`train`/`val`) per S1 entity.
+
+### Phase 0.2-0.5: blocking statistics
+
+Answers what the signals can and cannot reach before any blocking is built
+(signal coverage, residue, candidate census, zero-match analysis). It changes no
+analytical definition and produces no predictions.
+
+```bash
+# Measure first: arms are verified against the reference, then timed.
+python scripts/benchmark_phase0.py --config configs/config.yaml --sample 500000
+
+# The analysis itself. --workers 0 = auto (see "Workers and memory").
+python scripts/analyze_blocking_statistics.py --config configs/config.yaml --workers 0
+```
+
+Two flags worth knowing on a long run:
+
+* `--timings` records a per-phase wall-clock breakdown in `meta.phase_seconds`,
+  which is how you find out *which* phase a slow run is actually spending time in.
+* `--resume` reuses the completed per-pair phase from `_ckpt/` under
+  `--output-dir`. The checkpoint is keyed on every input that changes the numbers
+  (pair count, chunk size, sources, split, prepared corpus), so a stale one is
+  recomputed rather than silently trusted; `meta.resumed_phases` records what was
+  actually reused.
 
 ### HPC notes
 

@@ -85,7 +85,10 @@ compute:
   device: "auto"
 
   # Worker processes for the CPU-bound, shardable stages (prepare_data, feature
-  # generation). 0 = auto (min(cpu_count, 8)). Used by the parallelism work.
+  # generation, pair statistics). 0 = auto: the PHYSICAL core count, clamped to
+  # the number of chunks. Physical rather than logical because this work is python
+  # string/token bound, so hyperthread siblings add contention; and because a
+  # large HPC node should not be capped at 8. Set a number to pin it.
   num_workers: 0
 
   # ---- Consumed by the embedding / reranking stages when implemented ----
@@ -95,6 +98,15 @@ compute:
   # float16 halves VRAM and speeds up encoding for a negligible effect on
   # cosine ranking; float32 when exactness matters more than memory.
   embedding_dtype: "float16"
+  # GPUs a multi-GPU stage may use; empty = every visible device. Only the
+  # benchmark harness reads this today - no pipeline stage is GPU-bound.
+  gpu_ids: []
+
+  # ---- Consumed by scripts/analyze_blocking_statistics.py ----
+  # RAM the queued worker payloads may occupy, in bytes. Empty = a quarter of
+  # currently-available RAM. The per-pair chunks are reduced to fit, and the
+  # adjustment is logged, so a big worker count cannot OOM the node.
+  payload_budget_bytes: null
 
   # Shards for job-array execution of the candidate / inference stages.
   # 1 = single process. The candidate union is per-S1, so shards are independent

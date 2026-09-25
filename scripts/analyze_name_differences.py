@@ -48,7 +48,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import logging
-import multiprocessing as mp
 import sys
 import time
 import unicodedata
@@ -76,6 +75,7 @@ from src.utils import (  # noqa: E402
     encode_entity_id,
     fmt_int,
     log_memory,
+    resolve_workers,
     setup_logging,
     set_seed,
     write_json,
@@ -549,16 +549,14 @@ def _iter_pair_chunks(
 
 
 def _resolve_workers(requested: int, configured: int, n_chunks: int, log: logging.Logger) -> int:
-    """Decide the worker count: CLI > config > auto, clamped to the chunk count."""
-    if requested > 0:
-        workers = requested
-    elif configured > 0:
-        workers = configured
-    else:
-        workers = min(mp.cpu_count(), 8)
-    workers = max(1, min(workers, max(n_chunks, 1)))
-    log.info("classification workers: %d (cpu_count=%d)", workers, mp.cpu_count())
-    return workers
+    """Decide the worker count: CLI > config > physical cores, clamped to the chunks.
+
+    Delegates to :func:`src.utils.resolve_workers` so this script and Phase 0.2-0.5
+    cannot drift apart. Auto is the **physical** core count: the work is python
+    string classification rather than floating point, so hyperthread siblings add
+    contention, and the old hard cap of 8 threw away most of a large HPC node.
+    """
+    return resolve_workers(requested, configured, n_chunks, logger=log, label="classification workers")
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +729,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="source2,source3",
         help="comma-separated target sources to analyze",
     )
-    parser.add_argument("--workers", type=int, default=0, help="0 = auto (config, else min(cpu_count, 8))")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="0 = auto (config, else the physical core count, clamped to the chunk count)",
+    )
     parser.add_argument("--chunk-pairs", type=int, default=100_000, help="pairs per work chunk")
     parser.add_argument("--limit-pairs", type=int, default=None, help="analyze only the first N pairs (smoke tests)")
     parser.add_argument("--examples-per-category", type=int, default=25)
