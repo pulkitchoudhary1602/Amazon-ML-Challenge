@@ -40,6 +40,28 @@ Two conclusions that shape the rest of the work:
 Next blockers (token, character n-gram, then multilingual dense retrieval) are
 what move recall. Re-run the blocking evaluation after each one.
 
+### Corrected blocker ceiling
+
+The table above measures **exact-name blocking as shipped**. Phase 0.2-0.5
+measured something different: **signal coverage on already-known true pairs** -
+whether a signal *would* fire on a pair the ground truth already says is a
+match. That is not the same as a blocker being able to *propose* it.
+
+| Measurement | True pairs | Kind |
+|---|---|---|
+| Exact name (`name_norm`) as a blocker | 25.79% | retrievable today |
+| Union of the **three lexical generators** (exact name + rare token + char 3-gram) | **82.19%** | generator ceiling |
+| Union of all **four** signals (the above + address Jaccard) | 94.99% | **not** a blocker ceiling |
+
+**Do not present 94.99% as the achievable blocker recall.** Address is a
+**filter, not a candidate generator**: an address rule is applied to pairs some
+other signal already proposed, so it can only remove volume, never create a
+candidate. Three lexical generators can therefore reach at most **82.19%** of
+true pairs, and no matcher recovers a pair the blocker never proposed. Of the
+5.01% irreducible residue (382,722 pairs), 134,718 are cross-script
+(transliteration) - the case a character-level signal cannot see by
+construction.
+
 ---
 
 ## Repository layout
@@ -263,6 +285,89 @@ Two flags worth knowing on a long run:
   recomputed rather than silently trusted; `meta.resumed_phases` records what was
   actually reused.
 
+### Phase 1 Step 0: char-3-gram blocker calibration
+
+Phase 0 measured **signal coverage on known true pairs** - whether a signal
+*would* fire on a pair the ground truth already says is a match. It cannot say
+whether that signal is *retrievable* as a blocker, or what it costs to retrieve
+it. Step 0 measures the other half: the actual **char-3-gram blocker
+retrievability x candidate-volume curve** on the real corpus.
+
+This is an **experimental measurement stage**, not a production blocker.
+`char_ngram` stays disabled in `config.yaml`, the production blocker
+architecture is unchanged, and **no DF cap, rarest-K or Jaccard threshold has
+been selected yet** - those are chosen only after inspecting the HPC
+calibration results.
+
+```bash
+# Full grid: recall x volume for every (DF cap, rarest-K, Jaccard) cell.
+python scripts/calibrate_char_blocker.py \
+    --config configs/config.yaml \
+    --workers 0 \
+    --resume \
+    --timings
+
+# Volume only: price the whole grid without expanding candidates. Run this
+# first - it tells you whether the full grid is affordable before you spend a
+# night on it.
+python scripts/calibrate_char_blocker.py \
+    --config configs/config.yaml \
+    --workers 0 \
+    --volume-only \
+    --timings
+```
+
+**Calibration dimensions:** trigram document-frequency cap; rarest-K trigrams
+per entity; exact char-3-gram Jaccard verification threshold.
+
+**Retrieval design.** Target-corpus trigram DF -> retain eligible trigrams ->
+select the rarest K per entity -> inverted postings -> S1 retrieval -> exact
+Jaccard verification -> evaluation against ground truth. Retrieval is an
+inverted index; candidates are never produced by comparing every S1 name to
+every target name. Verification is bit-identical to Phase 0.1's
+`_trigram_jaccard`, so the curve is measured with the analytical definition
+already in use, not a substitute.
+
+**Metrics reported per calibration cell.** Blocking pair recall; macro entity
+recall; S1 full and partial recall; candidate count; average / median / p90 /
+p99 / max candidates per S1; zero-candidate S1 count and fraction; candidate
+precision; reduction ratio; and the per-source S2 / S3 breakdown.
+
+**Outputs** (under `<work_dir>/calibration/`):
+
+| File | Contents |
+|---|---|
+| `char_blocker_calibration.json` | every cell, all metrics, both volume kinds |
+| `char_blocker_calibration.csv` | the grid, one row per (set, DF cap, K, threshold) |
+| `char_blocker_volume.csv` | candidate volume per cell, bound vs exact |
+| `char_blocker_top_trigrams.csv` | trigram DF evidence per source |
+| `char_blocker_calibration.md` | the readable summary |
+| `_artifacts/` | resumable intermediate stores and indexes |
+
+`_artifacts/` is resumable intermediate data, not a result: it is regenerated
+from the prepared corpus and **must not be committed**.
+
+**What Step 0 already settles.**
+
+* `exact_name` is **redundant with char-3-gram for recall** - an exact
+  normalized name is contained in char matching, so it adds no pair that char
+  blocking cannot already reach. The `char_plus_exact` set equals `char` at every
+  threshold.
+* **Token blocking is disabled** and will be evaluated separately, as a
+  generator.
+* **Address is a matcher feature and filter**, not a generator.
+* **Embeddings / dense retrieval are deferred** to a later phase.
+
+**Validation status** - local synthetic fixtures only; the full corpus runs on
+HPC:
+
+| Suite | Result |
+|---|---|
+| `tests/test_char_blocker_calibration.py` | 36/36 |
+| `tests/test_blocking_statistics.py` | 39/39 |
+| `tests/test_compute_utils.py` | 23/23 |
+| `tests/test_recall_at_k.py` | 5/5 |
+
 ### HPC notes
 
 * Everything is a plain CLI command - wrap it in your scheduler's batch script.
@@ -472,6 +577,10 @@ Order matters - each step should be measured before the next:
    and union machinery are already in place (`BLOCKER_TOKEN` is registered and
    raises a clear "not implemented" error).
 2. **Character n-gram retrieval** - catches typos and transliteration variance.
+   Step 0 (`scripts/calibrate_char_blocker.py`) measures its recall x volume
+   curve before any operating parameters are chosen; see
+   [Phase 1 Step 0](#phase-1-step-0-char-3-gram-blocker-calibration). Up to
+   82.19% of true pairs is the ceiling for the lexical generators.
 3. **TF-IDF / BM25 lexical retrieval**, memory-efficient.
 4. **Dense multilingual embedding retrieval** - GPU when available, embeddings
    computed once per record (not per pair) and cached.
