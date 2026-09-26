@@ -171,6 +171,29 @@ blocking:
     # Inclusive trigram Jaccard cut-off applied to every retrieved pair.
     jaccard: 0.3
 
+  # ---- Experimental blocker. Implemented, but NOT part of the production union ----
+  # Exact index on a *derived* key: whitespace-split name_norm, drop legal-form and
+  # generic tokens (ltd/private/industries/india/...), dedupe, sort, join. So
+  # "acme industries pvt ltd" and "acme ltd industries" share the key "acme", and
+  # word order and legal form stop mattering. No df cap and no rarest_k: it indexes
+  # exactly one key per entity, and the uncapped cell is the one that was measured.
+  #
+  # enabled: false is deliberate. A default run of generate_candidates.py must keep
+  # producing the production union, and the frozen V1 matcher must keep seeing the
+  # feature file it was trained on. Enable it per run instead:
+  #
+  #   python scripts/generate_candidates.py \
+  #     --blockers exact_name,token,char_ngram,suffix_stripped --name <stem>
+  #
+  # Blocking-level results for this blocker were measured standalone (pair recall
+  # 0.5446, ~357.4M candidate rows) before it existed here; those are blocking-level
+  # numbers and are NOT evidence about final Macro F0.5.
+  suffix_stripped:
+    enabled: false
+    # name_norm, not name_key: the key is built by whitespace-splitting, and
+    # name_key has already removed the separators that define the tokens.
+    key: "name_norm"
+
   # ---- Roadmap: implemented in later milestones, disabled for now ----
   tfidf:
     enabled: false

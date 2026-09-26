@@ -49,8 +49,14 @@ from src.blocking import (  # noqa: E402
     BLOCKER_CHAR_NGRAM,
     BLOCKER_DENSE,
     BLOCKER_EXACT_NAME,
+    BLOCKER_SUFFIX_STRIPPED,
     BLOCKER_TOKEN,
+    COMBINABLE_BLOCKERS,
     INDEX_BUILDERS,
+    INDEX_LOADERS,
+    KEY_TRANSFORMS,
+    LEGAL_SUFFIXES,
+    OPTIONAL_BLOCKERS,
     UNION_BLOCKERS,
     CharNgramIndex,
     ExactNameIndex,
@@ -62,6 +68,8 @@ from src.blocking import (  # noqa: E402
     load_index,
     pack_pairs,
     resolve_blocker_settings,
+    suffix_stripped_key,
+    suffix_stripped_keys,
     tokenize,
     trigram_codes,
     union_blockers,
@@ -799,7 +807,7 @@ SOURCE1_ROWS = [
 ]
 
 
-def _write_end_to_end_fixture(root: Path) -> Path:
+def _write_end_to_end_fixture(root: Path, blockers=UNION_BLOCKERS, rows=None) -> Path:
     """A complete miniature dataset: prepared tables, a config, and the indexes.
 
     Every resolved path is redirected into ``root``. ``config.yaml`` names
@@ -807,6 +815,10 @@ def _write_end_to_end_fixture(root: Path) -> Path:
     path is resolved against the repository root rather than against ``work_dir`` -
     so overriding only ``work_dir`` would read and write the real ``outputs/`` tree,
     and a stale index from an earlier run would be loaded instead of rebuilt.
+
+    ``blockers`` and ``rows`` default to the production union on the shared fixture
+    tables, so an existing caller gets exactly what it got before; the
+    ``suffix_stripped`` tests pass their own.
     """
     root.mkdir(parents=True, exist_ok=True)
     with open(DEFAULT_CONFIG_PATH, encoding="utf-8") as handle:
@@ -830,14 +842,19 @@ def _write_end_to_end_fixture(root: Path) -> Path:
         yaml.safe_dump(config, handle)
 
     loaded = load_config(config_path)
-    for source, rows in (("source1", SOURCE1_ROWS), ("source2", SOURCE2_ROWS), ("source3", SOURCE3_ROWS)):
-        table = frame(source, rows)
+    tables = rows or {
+        "source1": SOURCE1_ROWS,
+        "source2": SOURCE2_ROWS,
+        "source3": SOURCE3_ROWS,
+    }
+    for source, source_rows in tables.items():
+        table = frame(source, source_rows)
         path = prepared_path(loaded, "train", source)
         path.parent.mkdir(parents=True, exist_ok=True)
         table.to_csv(path, sep="\t", index=False)
 
     for source in ("source2", "source3"):
-        for blocker in UNION_BLOCKERS:
+        for blocker in blockers:
             build_index(loaded, "train", source, blocker, log=LOG)
     return config_path
 
@@ -846,20 +863,20 @@ _FIXTURE_ROOT = _SCRATCH / "end_to_end"
 _FIXTURE_CONFIG = _write_end_to_end_fixture(_FIXTURE_ROOT)
 
 
-def _run_generate(extra: list[str], name: str) -> tuple[pd.DataFrame, dict]:
+def _run_generate(extra: list[str], name: str, config_path: Path | None = None) -> tuple[pd.DataFrame, dict]:
     import json
 
     from scripts import generate_candidates
 
     argv = [
-        "--config", str(_FIXTURE_CONFIG),
+        "--config", str(config_path or _FIXTURE_CONFIG),
         "--log-level", "CRITICAL",
         "--name", name,
         *extra,
     ]
     code = generate_candidates.main(argv)
     assert code == 0, code
-    loaded = load_config(_FIXTURE_CONFIG)
+    loaded = load_config(config_path or _FIXTURE_CONFIG)
     from src.data_loader import candidates_path
 
     output = candidates_path(loaded, name)
@@ -1006,6 +1023,418 @@ def test_generate_candidates_help_still_lists_the_original_flags():
 
 
 # ---------------------------------------------------------------------------
+# suffix_stripped: an optional blocker, deliberately NOT in the production union
+# ---------------------------------------------------------------------------
+# The reference below is the rule AS SPECIFIED - split on whitespace, drop
+# legal-form tokens but never all of them, deduplicate, sort - written out again
+# here rather than imported, so the test cannot pass merely by agreeing with the
+# implementation it is checking. The token list is a verbatim copy of the one the
+# standalone blocking analysis measured with; the two are pinned together by
+# test_suffix_stripped_legal_suffix_set_is_the_measured_one.
+REFERENCE_LEGAL_SUFFIXES = frozenset(
+    {
+        "ltd", "limited", "pvt", "private", "inc", "incorporated", "llp", "llc", "plc",
+        "co", "company", "corp", "corporation", "enterprises", "enterprise", "industries",
+        "industry", "services", "service", "solutions", "solution", "technologies",
+        "technology", "tech", "systems", "system", "group", "holdings", "international",
+        "intl", "and", "the", "of", "india", "traders", "trading", "agency", "agencies",
+        "stores", "store", "shop", "shoppe", "centre", "center", "works", "products",
+        "exports", "imports", "associates", "consultants", "consultancy", "ventures",
+        "labs", "laboratories", "pharma", "pharmaceuticals", "motors", "auto", "automobiles",
+    }
+)
+
+# Names the key function is cross-checked on: plain, legal-only, mixed, repeated
+# tokens, word order, punctuation already normalized to spaces, and a Devanagari
+# name (which has no legal-form tokens at all and must survive untouched).
+SUFFIX_KEY_NAMES = [
+    "acme holdings",
+    "acme industries private limited",
+    "zenith enterprises private limited",
+    "ltd limited pvt",
+    "the of and",
+    "india traders",
+    "acme acme zenith",
+    "zenith acme",
+    "acme zenith",
+    "shree ganesh traders india",
+    "quick mart",
+    "quickmart",
+    "a",
+    "ltd acme ltd",
+    "राम मार्केटिंग",
+    "acme ltd india traders and the of",
+]
+
+
+def reference_suffix_key(name: str) -> str:
+    """The specified rule, in plain python, for any already-normalized name."""
+    tokens = name.split()
+    kept = [token for token in tokens if token not in REFERENCE_LEGAL_SUFFIXES] or tokens
+    return " ".join(sorted(set(kept)))
+
+
+def test_suffix_stripped_legal_suffix_set_is_the_measured_one():
+    assert LEGAL_SUFFIXES == REFERENCE_LEGAL_SUFFIXES
+    # a count as well as a set equality, so a silent edit to both copies is caught
+    assert len(LEGAL_SUFFIXES) == 59
+
+
+def test_suffix_stripped_key_is_hand_computed():
+    # legal-form tokens only: the fallback keeps them, so the name is NOT emptied
+    assert suffix_stripped_key("ltd limited pvt") == "limited ltd pvt"
+    assert suffix_stripped_key("the of and") == "and of the"
+    assert suffix_stripped_key("india traders") == "india traders"
+    # legal tokens are dropped wherever they appear, and every one of them is
+    assert suffix_stripped_key("acme industries private limited") == "acme"
+    assert suffix_stripped_key("acme ltd india traders and the of") == "acme"
+    assert suffix_stripped_key("shree ganesh traders india") == "ganesh shree"
+    # a name with no legal tokens is unchanged apart from the sort/dedupe
+    assert suffix_stripped_key("quick mart") == "mart quick"
+    assert suffix_stripped_key("quickmart") == "quickmart"
+    # no tokens at all means no key
+    assert suffix_stripped_key("") == ""
+    assert suffix_stripped_key("   ") == ""
+    assert suffix_stripped_key(None) == ""
+
+
+def test_suffix_stripped_key_is_insensitive_to_order_and_repetition():
+    # word order: identity
+    assert suffix_stripped_key("zenith acme") == suffix_stripped_key("acme zenith")
+    # repetition: identity (the key is a token SET, not a sequence)
+    assert suffix_stripped_key("acme acme zenith") == suffix_stripped_key("acme zenith")
+    # legal-form position does not matter either
+    assert suffix_stripped_key("acme pvt zenith ltd") == suffix_stripped_key("acme zenith")
+
+
+def test_suffix_stripped_key_matches_the_reference_on_every_sample():
+    for name in SUFFIX_KEY_NAMES:
+        assert suffix_stripped_key(name) == reference_suffix_key(name), name
+        # and the reference is not trivially empty, which would make the check vacuous
+    assert sum(1 for name in SUFFIX_KEY_NAMES if reference_suffix_key(name)) >= len(SUFFIX_KEY_NAMES) - 1
+
+
+def test_suffix_stripped_key_keeps_a_name_that_is_entirely_legal_tokens_distinguishable():
+    """The point of the fallback: "Pvt Ltd" and "Private Limited" must not collide."""
+    assert suffix_stripped_key("pvt ltd") != suffix_stripped_key("private limited")
+    assert suffix_stripped_key("pvt ltd") == "ltd pvt"
+    assert suffix_stripped_key("private limited") == "limited private"
+
+
+def test_suffix_stripped_key_matches_the_analysis_reference_when_available():
+    """Cross-check against the standalone analysis, where that script is present.
+
+    ``scripts/analyze_blocking_errors.py`` is where the suffix-stripped proposal was
+    defined and measured. It is an analysis script and is not part of the pipeline,
+    so this is skipped - loudly - rather than failing when it is absent.
+    """
+    try:
+        from scripts.analyze_blocking_errors import _suffix_stripped
+    except Exception:
+        print("      (skipped: scripts/analyze_blocking_errors.py is not importable here)")
+        return
+
+    for name in SUFFIX_KEY_NAMES:
+        expected = _suffix_stripped((name, "", "", ""))
+        assert suffix_stripped_key(name) == (expected[0] if expected else ""), name
+
+
+def test_suffix_stripped_keys_vectorizes_the_scalar():
+    names = ["", "acme industries pvt ltd", "zenith", "ltd ltd"]
+    expected = [suffix_stripped_key(name) for name in names]
+    assert list(suffix_stripped_keys(np.array(names, dtype=object))) == expected
+    assert list(suffix_stripped_keys(pd.Series(names, dtype=object))) == expected
+    # an empty input must not raise or come back as a non-array
+    empty = suffix_stripped_keys(np.empty(0, dtype=object))
+    assert len(empty) == 0
+
+
+def test_suffix_stripped_is_selectable_but_not_part_of_production():
+    from src.blocking import KNOWN_BLOCKERS, _key_field_for
+
+    assert BLOCKER_SUFFIX_STRIPPED in KNOWN_BLOCKERS, "the CLI must accept it"
+    assert BLOCKER_SUFFIX_STRIPPED in OPTIONAL_BLOCKERS
+    assert BLOCKER_SUFFIX_STRIPPED not in UNION_BLOCKERS, "production must be unchanged"
+    assert COMBINABLE_BLOCKERS == UNION_BLOCKERS + OPTIONAL_BLOCKERS
+    assert BLOCKER_SUFFIX_STRIPPED in INDEX_BUILDERS
+    assert BLOCKER_SUFFIX_STRIPPED in INDEX_LOADERS
+    assert BLOCKER_SUFFIX_STRIPPED in KEY_TRANSFORMS
+    # name_norm, not name_key: the key is built from whitespace-split tokens
+    assert _key_field_for({}, BLOCKER_SUFFIX_STRIPPED) == "name_norm"
+    assert _key_field_for(
+        {"blocking": {BLOCKER_SUFFIX_STRIPPED: {"key": "name_norm"}}}, BLOCKER_SUFFIX_STRIPPED
+    ) == "name_norm"
+    # one derived key per entity: no df cap and no rarest-K ranking to resolve
+    assert resolve_blocker_settings({}, BLOCKER_SUFFIX_STRIPPED) == {}
+
+
+def test_suffix_stripped_adds_no_evidence_column():
+    """Enabling it must not change the candidate schema.
+
+    The frozen V1 matcher rejects a feature file with an unexpected column, so a new
+    evidence column would have made the A/B experiment impossible on the model side.
+    """
+    production = [BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM]
+    assert evidence_columns_for(production) == ["token_df", "char_jaccard"]
+    assert evidence_columns_for(production + [BLOCKER_SUFFIX_STRIPPED]) == ["token_df", "char_jaccard"]
+    assert evidence_columns_for([BLOCKER_SUFFIX_STRIPPED]) == []
+
+
+def test_suffix_stripped_keys_a_derived_token_set_not_the_raw_name():
+    """The blocker's whole value: legal form and word order stop mattering."""
+    target = frame("source2", [(1, "acme holdings"), (2, "zenith traders"), (3, "core logistics")])
+    index = build(
+        ExactNameIndex, [target], "source2", key_field="name_norm",
+        key_transform=BLOCKER_SUFFIX_STRIPPED,
+    )
+
+    assert index.key_transform == BLOCKER_SUFFIX_STRIPPED
+    assert index.key_field == "name_norm", "the source column is not rewritten"
+    # the stored keys are the stripped ones. "holdings" and "traders" are legal-form
+    # tokens; "logistics" is not, and is kept - the list is a hypothesis about naming
+    # conventions, not a rule that every company word is a suffix.
+    assert {index.key_at(position) for position in range(index.n_unique_keys)} == {
+        "acme",
+        "zenith",
+        "core logistics",
+    }
+
+    # "acme industries pvt ltd" and "acme" are a match for this blocker...
+    query = frame("source1", [(10, "acme industries pvt ltd"), (11, "traders acme")])
+    assert _targets(index, query) == {"S2-1"}
+    # ...and the same query against the exact-name index finds nothing, which is what
+    # makes the blocker additive rather than a duplicate of exact_name
+    exact = build(ExactNameIndex, [target], "source2", key_field="name_norm")
+    assert _targets(exact, query) == set()
+
+
+def test_suffix_stripped_transforms_the_query_side_too():
+    """A missed transform on the query side would be silent: every lookup would miss."""
+    target = frame("source2", [(1, "acme holdings"), (2, "zenith traders")])
+    index = build(
+        ExactNameIndex, [target], "source2", key_field="name_norm",
+        key_transform=BLOCKER_SUFFIX_STRIPPED,
+    )
+    exact = build(ExactNameIndex, [target], "source2", key_field="name_norm")
+
+    # the suffix index answers the stripped forms, and misses a name that has no
+    # stripped counterpart in the table
+    assert index.lookup_codes("acme holdings").size == 1
+    assert index.lookup_codes("acme").size == 1
+    assert index.lookup_codes("acme industries pvt ltd").size == 1
+    assert index.lookup_codes("zenith traders").size == 1
+    assert index.lookup_codes("zenith").size == 1
+    assert index.lookup_codes("acme logistics").size == 0
+    # the exact index is the mirror image: it only answers the raw names
+    assert exact.lookup_codes("acme holdings").size == 1
+    assert exact.lookup_codes("zenith traders").size == 1
+    assert exact.lookup_codes("acme").size == 0
+    assert exact.lookup_codes("zenith").size == 0
+    # both agree that the empty key matches nothing
+    assert index.lookup_codes("").size == 0
+    assert exact.lookup_codes("").size == 0
+
+
+def test_suffix_stripped_round_trips_through_disk_keeping_its_transform():
+    """The transform must be persisted: a reloaded index that lost it would miss everything."""
+    target = frame("source2", [(1, "acme holdings"), (2, "zenith traders")])
+    index = build(
+        ExactNameIndex, [target], "source2", key_field="name_norm",
+        key_transform=BLOCKER_SUFFIX_STRIPPED,
+    )
+    directory = _SCRATCH / "suffix_stripped_round_trip"
+    index.save(directory)
+
+    reloaded = load_index_at(directory, BLOCKER_SUFFIX_STRIPPED)
+    assert reloaded.key_transform == BLOCKER_SUFFIX_STRIPPED
+    assert reloaded.key_field == "name_norm"
+    assert np.array_equal(reloaded.key_hashes, index.key_hashes)
+    assert reloaded.keys_blob == index.keys_blob
+    assert reloaded.describe()["key_transform"] == BLOCKER_SUFFIX_STRIPPED
+
+    query = frame("source1", [(10, "acme pvt ltd"), (11, "zenith")])
+    assert _targets(reloaded, query) == _targets(index, query) == {"S2-1", "S2-2"}
+
+
+def test_an_unknown_key_transform_is_rejected():
+    try:
+        ExactNameIndex(
+            source="source2",
+            prefix="S2",
+            key_field="name_norm",
+            key_hashes=np.empty(0, dtype=np.uint64),
+            key_offsets=np.zeros(1, dtype=np.int64),
+            keys_blob=b"",
+            postings_offsets=np.zeros(1, dtype=np.int64),
+            postings=np.empty(0, dtype=np.int64),
+            key_transform="nonsense",
+        )
+    except ValueError as error:
+        assert "nonsense" in str(error)
+        assert sorted(KEY_TRANSFORMS) == [BLOCKER_SUFFIX_STRIPPED]
+    else:
+        raise AssertionError("an unknown key transform must raise")
+
+
+# ---------------------------------------------------------------------------
+# suffix_stripped end to end: additive, aligned, and production-preserving
+# ---------------------------------------------------------------------------
+# Chosen so that two pairs are reachable ONLY by suffix_stripped:
+#
+#   S1-1 "zenith enterprises private limited"  -> key "zenith"
+#   S2-1 "zenith"          -> key "zenith"      <- suffix-only
+#   S2-2 "zenith trading"  -> key "zenith"      <- suffix-only ("trading" is legal)
+#
+# The production union misses both: exact_name sees different strings; the token
+# blocker spends S1-1's single rarest_k slot on "enterprises" (df 1, beating
+# "zenith" at df 2) and retrieves only S2-3; the char blocker's full-string trigram
+# Jaccard is 0.14 and 0.11, below the 0.3 cut-off.
+#
+# "trading" and "holdings" are on the legal-suffix list; "foods" and "logistics" are
+# not, so "zenith foods" would NOT collapse to "zenith". The rows below are picked
+# against the real list, not against intuition.
+SUFFIX_SOURCE1_ROWS = [
+    (1, "zenith enterprises private limited"),
+    (2, "acme holdings"),
+    (3, "acme pvt ltd"),
+]
+SUFFIX_SOURCE2_ROWS = [
+    (1, "zenith"),
+    (2, "zenith trading"),
+    (3, "enterprises"),
+    (4, "acme holdings"),
+]
+SUFFIX_SOURCE3_ROWS = [
+    (1, "acme holdings"),
+]
+SUFFIX_ONLY_PAIRS = {("S1-1", "S2-1"), ("S1-1", "S2-2")}
+
+_SUFFIX_ROOT = _SCRATCH / "suffix_end_to_end"
+_SUFFIX_CONFIG = _write_end_to_end_fixture(
+    _SUFFIX_ROOT,
+    blockers=COMBINABLE_BLOCKERS,
+    rows={
+        "source1": SUFFIX_SOURCE1_ROWS,
+        "source2": SUFFIX_SOURCE2_ROWS,
+        "source3": SUFFIX_SOURCE3_ROWS,
+    },
+)
+
+SUFFIX_BLOCKERS_ARG = ",".join(COMBINABLE_BLOCKERS)
+
+
+def _pairs_of(table: pd.DataFrame) -> set[tuple[str, str]]:
+    return {
+        (row.source1_entity_id, row.matched_entity_id) for row in table.itertuples(index=False)
+    }
+
+
+def _provenance_of(table: pd.DataFrame) -> dict[tuple[str, str], set[str]]:
+    return {
+        (row.source1_entity_id, row.matched_entity_id): set(row.blockers.split(","))
+        for row in table.itertuples(index=False)
+    }
+
+
+def test_end_to_end_suffix_stripped_default_run_is_still_the_production_union():
+    """The config leaves it disabled, so a bare run must not change anything."""
+    from scripts.generate_candidates import enabled_blockers
+
+    loaded = load_config(_SUFFIX_CONFIG)
+    assert enabled_blockers(loaded, None, LOG) == list(UNION_BLOCKERS)
+
+    bare, stats = _run_generate([], "suffix_bare", _SUFFIX_CONFIG)
+    assert stats["blockers"] == list(UNION_BLOCKERS)
+    assert stats["evidence_columns"] == ["token_df", "char_jaccard"]
+    assert not any("suffix_stripped" in row.blockers for row in bare.itertuples(index=False))
+    assert _pairs_of(bare).isdisjoint(SUFFIX_ONLY_PAIRS)
+
+
+def test_end_to_end_suffix_stripped_is_additive_and_preserves_production():
+    production, _ = _run_generate(
+        ["--blockers", ",".join(UNION_BLOCKERS)], "suffix_prod", _SUFFIX_CONFIG
+    )
+    augmented, stats = _run_generate(
+        ["--blockers", SUFFIX_BLOCKERS_ARG], "suffix_aug", _SUFFIX_CONFIG
+    )
+
+    assert stats["blockers"] == list(COMBINABLE_BLOCKERS)
+    # no new evidence column: the candidate schema is unchanged by enabling it
+    assert stats["evidence_columns"] == ["token_df", "char_jaccard"]
+    assert list(augmented.columns) == list(production.columns)
+
+    prod_pairs = _pairs_of(production)
+    aug_pairs = _pairs_of(augmented)
+
+    # 1. nothing is removed, and the two constructed pairs are genuinely new
+    assert prod_pairs < aug_pairs, "the augmented set must be a strict superset here"
+    assert aug_pairs - prod_pairs == SUFFIX_ONLY_PAIRS
+    assert not any("suffix_stripped" in row.blockers for row in production.itertuples(index=False))
+
+    # 2. every pre-existing pair keeps every blocker attribution it already had
+    prod_prov = _provenance_of(production)
+    aug_prov = _provenance_of(augmented)
+    for pair, names in prod_prov.items():
+        assert names <= aug_prov[pair], (pair, names, aug_prov[pair])
+
+    # 3. a pair the new blocker proposed is labelled as such, and only those are
+    for pair, names in aug_prov.items():
+        suffix_labels = {name for name in names if name.endswith(":suffix_stripped")}
+        if pair in SUFFIX_ONLY_PAIRS:
+            assert len(suffix_labels) == 1, (pair, names)
+        elif not suffix_labels:
+            assert names == prod_prov[pair], pair
+
+    # 4. duplicate removal: one row per (S1, target), still
+    assert not augmented.duplicated(["source1_entity_id", "matched_entity_id"]).any()
+
+    # 5. source/entity alignment: the label agrees with the target id, and the
+    #    suffix label's source agrees with the row's source
+    label_for = {"S2": "source2", "S3": "source3"}
+    assert (augmented["source"] == augmented["matched_entity_id"].str.slice(0, 2)).all()
+    assert stats["pairs_by_source"]["S2"] + stats["pairs_by_source"]["S3"] == len(augmented)
+    for row in augmented.itertuples(index=False):
+        assert row.blockers, row
+        for name in row.blockers.split(","):
+            assert name.startswith(label_for[row.source] + ":"), row
+
+    # 6. the union still writes provenance in registry order, so the string does not
+    #    depend on the CLI spelling (checked on the raw string: a set would lose order)
+    for row in augmented.itertuples(index=False):
+        ranks = [
+            COMBINABLE_BLOCKERS.index(name.rsplit(":", 1)[-1])
+            for name in row.blockers.split(",")
+        ]
+        assert ranks == sorted(ranks), row
+
+
+def test_end_to_end_suffix_stripped_is_deterministic_and_worker_independent():
+    first, stats_first = _run_generate(["--blockers", SUFFIX_BLOCKERS_ARG], "suffix_det_a", _SUFFIX_CONFIG)
+    second, stats_second = _run_generate(["--blockers", SUFFIX_BLOCKERS_ARG], "suffix_det_b", _SUFFIX_CONFIG)
+    assert first.equals(second)
+    assert stats_first["candidate_pairs"] == stats_second["candidate_pairs"]
+
+    parallel, stats_parallel = _run_generate(
+        ["--blockers", SUFFIX_BLOCKERS_ARG, "--workers", "3"], "suffix_workers", _SUFFIX_CONFIG
+    )
+    assert stats_parallel["candidate_pairs"] == stats_first["candidate_pairs"]
+    assert sorted(_pairs_of(parallel)) == sorted(_pairs_of(first))
+
+
+def test_end_to_end_suffix_stripped_rejects_an_unknown_transform_name():
+    """No blocker may be silently dropped from an explicit list."""
+    from scripts.generate_candidates import enabled_blockers
+
+    loaded = load_config(_SUFFIX_CONFIG)
+    for requested, expected in [
+        ("exact_name,suffix_stripped", [BLOCKER_EXACT_NAME, "suffix_stripped"]),
+        ("suffix_stripped", ["suffix_stripped"]),
+        ("suffix_stripped,exact_name,token", [BLOCKER_EXACT_NAME, BLOCKER_TOKEN, "suffix_stripped"]),
+    ]:
+        assert enabled_blockers(loaded, requested, LOG) == expected, requested
+
+
+# ---------------------------------------------------------------------------
 # shared assertions
 # ---------------------------------------------------------------------------
 def _unpack(packed: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1037,11 +1466,11 @@ def _assert_same_index(left, right) -> None:
     assert left.df_cap == right.df_cap and left.rarest_k == right.rarest_k
 
 
-def load_index_at(directory: Path, workers: int = 1):
+def load_index_at(directory: Path, blocker: str = BLOCKER_CHAR_NGRAM, workers: int = 1):
     """Load a persisted index of any implemented blocker, by directory."""
     from src.blocking import _load_index_at
 
-    return _load_index_at(directory, BLOCKER_CHAR_NGRAM, log=LOG, workers=workers)
+    return _load_index_at(directory, blocker, log=LOG, workers=workers)
 
 
 # ---------------------------------------------------------------------------

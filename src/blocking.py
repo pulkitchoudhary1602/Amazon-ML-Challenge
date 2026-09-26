@@ -163,12 +163,33 @@ PAIR_MULTIPLIER = 10**11
 BLOCKER_EXACT_NAME = "exact_name"
 BLOCKER_TOKEN = "token"
 BLOCKER_CHAR_NGRAM = "char_ngram"
+BLOCKER_SUFFIX_STRIPPED = "suffix_stripped"
 BLOCKER_DENSE = "dense"
-KNOWN_BLOCKERS = (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM, BLOCKER_DENSE)
+KNOWN_BLOCKERS = (
+    BLOCKER_EXACT_NAME,
+    BLOCKER_TOKEN,
+    BLOCKER_CHAR_NGRAM,
+    BLOCKER_SUFFIX_STRIPPED,
+    BLOCKER_DENSE,
+)
 
-# The blockers a union may combine, in the order provenance is built. Fixed order
-# so the candidate output does not depend on CLI argument order.
+# The PRODUCTION union, in the order provenance is built. Fixed order so the
+# candidate output does not depend on CLI argument order. This is the set the
+# config enables by default and the set the frozen V1 matcher was trained on, so
+# nothing experimental belongs here.
 UNION_BLOCKERS = (BLOCKER_EXACT_NAME, BLOCKER_TOKEN, BLOCKER_CHAR_NGRAM)
+
+# Blockers that are implemented and that a union CAN combine when explicitly
+# asked, but that are NOT part of production. The candidate generator offers them
+# through ``--blockers`` / ``blocking.<name>.enabled``; a run that does not ask for
+# one is byte-identical to a run from before the blocker existed, because
+# :data:`UNION_BLOCKERS` and the config default are what a bare run reads.
+OPTIONAL_BLOCKERS = (BLOCKER_SUFFIX_STRIPPED,)
+
+# Every blocker a union can order provenance for, and every blocker with a
+# persisted index. :data:`UNION_BLOCKERS` first, so appending an optional blocker
+# cannot renumber or reorder the provenance of a production-only union.
+COMBINABLE_BLOCKERS = UNION_BLOCKERS + OPTIONAL_BLOCKERS
 
 # Which normalized column each blocker keys on when the config does not say. The
 # char blocker keys on ``name_key`` (separators removed) because that is the
@@ -178,12 +199,21 @@ DEFAULT_KEY_FIELDS = {
     BLOCKER_EXACT_NAME: NAME_NORM,
     BLOCKER_TOKEN: NAME_NORM,
     BLOCKER_CHAR_NGRAM: NAME_KEY,
+    # suffix_stripped keys on name_norm, not name_key: its key is built by
+    # whitespace-splitting the normalized name and dropping legal-form tokens, and
+    # name_key has already removed the separators that define those tokens.
+    BLOCKER_SUFFIX_STRIPPED: NAME_NORM,
     BLOCKER_DENSE: NAME_NORM,
 }
 
 # The provisional production cell, per blocker. These are the values the
 # calibration measured; changing them changes the blocker, so they are defaults
 # for a fresh config rather than tuning knobs.
+#
+# ``suffix_stripped`` deliberately has NO entry. It is an exact index on one
+# derived key per entity - there is no df cap to apply and no rarest-K ranking to
+# do - and the cell that was measured for it was the uncapped one, so giving it
+# settings would silently define a different blocker than the one measured.
 BLOCKER_SETTING_DEFAULTS = {
     BLOCKER_TOKEN: {"df_cap": 1000, "rarest_k": 1},
     BLOCKER_CHAR_NGRAM: {"df_cap": 1000, "rarest_k": 5, "jaccard": 0.3},
@@ -193,6 +223,12 @@ BLOCKER_SETTING_DEFAULTS = {
 # ``blocker -> (column_name, format)``. The column is written **only when that
 # blocker is enabled**, so an exact-name-only run keeps the original four-column
 # candidate schema. Values are empty for pairs the blocker did not propose.
+#
+# ``suffix_stripped`` has no entry, and that is load-bearing: it produces no
+# per-pair measurement, so enabling it adds no column to the candidate file and
+# therefore no column to the feature file. The frozen V1 matcher refuses an
+# unexpected feature column (``resolve_feature_columns``), so a new evidence column
+# here would have blocked the A/B experiment on the model side.
 EVIDENCE_COLUMNS = {
     BLOCKER_CHAR_NGRAM: ("char_jaccard", "%.4f"),
     BLOCKER_TOKEN: ("token_df", "%.0f"),
@@ -201,7 +237,9 @@ EVIDENCE_COLUMNS = {
 
 def evidence_columns_for(blockers: Sequence[str]) -> list[str]:
     """Candidate-file columns the enabled blockers add, in registry order."""
-    return [EVIDENCE_COLUMNS[b][0] for b in UNION_BLOCKERS if b in blockers and b in EVIDENCE_COLUMNS]
+    return [
+        EVIDENCE_COLUMNS[b][0] for b in COMBINABLE_BLOCKERS if b in blockers and b in EVIDENCE_COLUMNS
+    ]
 
 
 
@@ -268,6 +306,94 @@ def resolve_blocker_settings(config: dict, blocker: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Key transforms
+# ---------------------------------------------------------------------------
+# A blocker whose key is a *function of* a prepared column rather than the column
+# itself needs the transform applied in three places - at build, at query, and (for
+# a single-key index) when verifying a hash hit - and all three must apply the same
+# one or the index silently stops matching itself. So the transform is named on the
+# index and resolved through this registry, which is persisted in meta.json next to
+# the arrays.
+#
+# A transform maps an object array of prepared values to an object array of blocking
+# keys, with "" meaning "this row has no key". It has to be a pure function of its
+# input: two runs over the same corpus must produce the same index.
+
+# Legal-form and generic tokens that carry no discriminating signal. This is the
+# list the ``suffix_stripped`` proposal in scripts/analyze_blocking_errors.py was
+# measured with, copied here verbatim so production and the measurement cannot
+# drift. It is a hypothesis about naming conventions, not a legal fact.
+LEGAL_SUFFIXES = frozenset(
+    {
+        "ltd", "limited", "pvt", "private", "inc", "incorporated", "llp", "llc", "plc",
+        "co", "company", "corp", "corporation", "enterprises", "enterprise", "industries",
+        "industry", "services", "service", "solutions", "solution", "technologies",
+        "technology", "tech", "systems", "system", "group", "holdings", "international",
+        "intl", "and", "the", "of", "india", "traders", "trading", "agency", "agencies",
+        "stores", "store", "shop", "shoppe", "centre", "center", "works", "products",
+        "exports", "imports", "associates", "consultants", "consultancy", "ventures",
+        "labs", "laboratories", "pharma", "pharmaceuticals", "motors", "auto", "automobiles",
+    }
+)
+
+
+def strip_legal_suffixes(tokens: Sequence[str]) -> tuple[str, ...]:
+    """Drop legal-form tokens, but never all of them.
+
+    ``"Pvt Ltd"`` would otherwise reduce to nothing and collide with every other
+    stripped-to-empty name, which is worse than not stripping it.
+    """
+    stripped = tuple(token for token in tokens if token not in LEGAL_SUFFIXES)
+    return stripped or tuple(tokens)
+
+
+def suffix_stripped_key(name: object) -> str:
+    """The ``suffix_stripped`` blocking key for one normalized name.
+
+    Tokens are whitespace-split, legal-form tokens are dropped (never all of them),
+    and the survivors are deduplicated and sorted, so the key is a canonical form of
+    the token *set*: ``"Acme Industries Pvt Ltd"`` and ``"acme ltd industries"``
+    produce the same key while ``"Acme Industries"`` and ``"Acme Trading"`` do not.
+
+    Sorting is what makes this a distinct blocker rather than a looser exact match.
+    It also means the key is insensitive to word order, which is the behaviour that
+    was measured - not an accident of the implementation.
+
+    Returns ``""`` for a name with no tokens, which every caller reads as "no key".
+    """
+    tokens = name.split() if isinstance(name, str) else []
+    if not tokens:
+        return ""
+    kept = strip_legal_suffixes(tokens)
+    return " ".join(sorted(set(kept)))
+
+
+def suffix_stripped_keys(values: pd.Series | Sequence[str] | np.ndarray) -> np.ndarray:
+    """Vectorized :func:`suffix_stripped_key`, as an object array of ``str``.
+
+    The loop is per row because the work is per row - splitting, filtering and
+    sorting a handful of tokens is not a vectorized shape. This matches the other
+    per-row code on the index paths (``stable_hash64`` is a per-string blake2b loop
+    and the empty-key mask is an ``np.fromiter``), and it is bounded by the corpus,
+    not by the candidate count.
+    """
+    array = (
+        values.to_numpy(dtype=object) if isinstance(values, pd.Series) else np.asarray(values, dtype=object)
+    )
+    out = np.empty(len(array), dtype=object)
+    for index, value in enumerate(array):
+        out[index] = suffix_stripped_key(value)
+    return out
+
+
+# ``blocker -> transform``. The key is the blocker name, so "which blocker built this
+# index" and "which transform does it apply" are the same question and cannot disagree.
+KEY_TRANSFORMS: dict[str, Callable[[np.ndarray], np.ndarray]] = {
+    BLOCKER_SUFFIX_STRIPPED: suffix_stripped_keys,
+}
+
+
+# ---------------------------------------------------------------------------
 # Exact-name index
 # ---------------------------------------------------------------------------
 class ExactNameIndex:
@@ -275,10 +401,19 @@ class ExactNameIndex:
 
     Thread- and process-safe for reads; building is single-process.
 
+    One entity contributes exactly one key, which is what makes this the right
+    shape for both the exact-name blocker and the ``suffix_stripped`` blocker: the
+    latter indexes one derived key per entity rather than a key list, so it needs
+    this layout and not :class:`MultiKeyIndex`'s. ``key_transform`` selects the
+    derivation; ``None`` means the prepared column is the key.
+
     Attributes:
         source: logical source name, e.g. ``"source2"``.
         prefix: id prefix, e.g. ``"S2"``.
-        key_field: the normalized column that was indexed.
+        key_field: the normalized column that was indexed. When ``key_transform`` is
+            set this is the column the transform *reads*, not the key that is stored.
+        key_transform: blocker name selecting the transform applied to ``key_field``
+            before indexing, or ``None`` for the column itself.
         key_hashes: sorted uint64 hashes of the unique keys.
         postings: int64 entity id codes, grouped by key.
     """
@@ -287,6 +422,7 @@ class ExactNameIndex:
         "source",
         "prefix",
         "key_field",
+        "key_transform",
         "key_hashes",
         "key_offsets",
         "keys_blob",
@@ -308,10 +444,16 @@ class ExactNameIndex:
         postings: np.ndarray,
         n_entities_indexed: int = 0,
         n_skipped_empty: int = 0,
+        key_transform: Optional[str] = None,
     ) -> None:
+        if key_transform is not None and key_transform not in KEY_TRANSFORMS:
+            raise ValueError(
+                f"unknown key transform {key_transform!r}; expected one of {sorted(KEY_TRANSFORMS)}"
+            )
         self.source = source
         self.prefix = prefix
         self.key_field = key_field
+        self.key_transform = key_transform
         self.key_hashes = key_hashes
         self.key_offsets = key_offsets
         self.keys_blob = keys_blob
@@ -319,6 +461,11 @@ class ExactNameIndex:
         self.postings = postings
         self.n_entities_indexed = n_entities_indexed
         self.n_skipped_empty = n_skipped_empty
+
+    @property
+    def _transform(self) -> Optional[Callable[[np.ndarray], np.ndarray]]:
+        """The key transform this index applies, or ``None`` for the identity."""
+        return KEY_TRANSFORMS.get(self.key_transform) if self.key_transform else None
 
     # -- introspection ------------------------------------------------------
     @property
@@ -346,6 +493,7 @@ class ExactNameIndex:
         return {
             "source": self.source,
             "key_field": self.key_field,
+            "key_transform": self.key_transform,
             "n_entities_indexed": int(self.n_entities_indexed),
             "n_skipped_empty_keys": int(self.n_skipped_empty),
             "n_unique_keys": int(self.n_unique_keys),
@@ -376,6 +524,7 @@ class ExactNameIndex:
         entity_column: str = "entity_id",
         log: Optional[logging.Logger] = None,
         total_rows: Optional[int] = None,
+        key_transform: Optional[str] = None,
     ) -> "ExactNameIndex":
         """Build an index from an iterable of prepared chunks.
 
@@ -393,10 +542,20 @@ class ExactNameIndex:
             entity_column: id column.
             log: logger for progress.
             total_rows: expected row count, for progress reporting.
+            key_transform: blocker name of a transform in :data:`KEY_TRANSFORMS` to
+                apply to ``key_field`` before hashing, or ``None`` to index the
+                column as it stands. Applied per chunk, so the same transform must
+                also be applied to every query - which is why it is stored on the
+                index and persisted in ``meta.json`` rather than left to the caller.
 
         Returns:
             A populated :class:`ExactNameIndex`.
         """
+        transform = KEY_TRANSFORMS.get(key_transform) if key_transform else None
+        if key_transform is not None and transform is None:
+            raise ValueError(
+                f"unknown key transform {key_transform!r}; expected one of {sorted(KEY_TRANSFORMS)}"
+            )
         log = log or logger
         hash_parts: list[np.ndarray] = []
         id_parts: list[np.ndarray] = []
@@ -416,6 +575,8 @@ class ExactNameIndex:
             rows_seen += len(chunk)
 
             keys = chunk[key_field].to_numpy(dtype=object)
+            if transform is not None:
+                keys = transform(keys)
             ids = chunk[entity_column].to_numpy(dtype=object)
 
             # Records whose normalized name is empty carry no blocking signal.
@@ -543,6 +704,7 @@ class ExactNameIndex:
             postings=postings,
             n_entities_indexed=rows_kept,
             n_skipped_empty=rows_skipped,
+            key_transform=key_transform,
         )
 
         if log:
@@ -571,10 +733,14 @@ class ExactNameIndex:
             {
                 "index_version": INDEX_VERSION,
                 "hash": HASH_NAME,
-                "blocker": BLOCKER_EXACT_NAME,
+                # The blocker that defines this index. An exact-name index and a
+                # suffix-stripped index are both ExactNameIndex objects and differ
+                # only by this field, so it is what tells them apart on disk.
+                "blocker": self.key_transform or BLOCKER_EXACT_NAME,
                 "source": self.source,
                 "prefix": self.prefix,
                 "key_field": self.key_field,
+                "key_transform": self.key_transform,
                 "n_entities_indexed": int(self.n_entities_indexed),
                 "n_skipped_empty_keys": int(self.n_skipped_empty),
                 "n_unique_keys": int(self.n_unique_keys),
@@ -623,6 +789,11 @@ class ExactNameIndex:
             postings=np.load(directory / POSTINGS_FILE),
             n_entities_indexed=int(meta.get("n_entities_indexed", 0)),
             n_skipped_empty=int(meta.get("n_skipped_empty_keys", 0)),
+            # Indexes written before key transforms existed have no such field; the
+            # format version is deliberately NOT bumped, because the arrays are
+            # unchanged and a bump would force every production index to be rebuilt
+            # to gain a field that is absent for the blockers that had none.
+            key_transform=meta.get("key_transform"),
         )
         if log:
             log.info("loaded index %s: %s", directory.name, index.describe())
@@ -674,6 +845,9 @@ class ExactNameIndex:
 
     def lookup_codes(self, key: str) -> np.ndarray:
         """Entity id codes for an exact key match. Empty array when absent."""
+        transform = self._transform
+        if transform is not None:
+            key = str(transform(np.array([key], dtype=object))[0])
         if not key:
             return self._EMPTY
         hashed = np.array([stable_hash64(key)], dtype=np.uint64)
@@ -688,9 +862,16 @@ class ExactNameIndex:
         ``positions[i]`` is the unique-key position for ``keys[i]`` (-1 on miss)
         and ``counts[i]`` the number of postings. Empty keys always miss.
 
+        ``keys`` are raw values of :attr:`key_field`; the index's own transform is
+        applied here, so a caller cannot accidentally query a suffix-stripped index
+        with unstripped names and get silent misses.
+
         Memory: O(len(keys)) int64s - 2.2M S1 entities is ~35MB.
         """
         key_array = keys.to_numpy(dtype=object) if isinstance(keys, pd.Series) else np.asarray(keys, dtype=object)
+        transform = self._transform
+        if transform is not None:
+            key_array = transform(key_array)
         non_empty = np.fromiter(
             (isinstance(k, str) and len(k) > 0 for k in key_array), dtype=bool, count=len(key_array)
         )
@@ -2151,11 +2332,42 @@ def _not_implemented(blocker: str):
     def _builder(*args: Any, **kwargs: Any):
         raise NotImplementedError(
             f"blocker {blocker!r} is planned but not implemented yet.\n"
-            f"  Implemented blockers: {UNION_BLOCKERS}.\n"
+            f"  Implemented blockers: {COMBINABLE_BLOCKERS}.\n"
             f"  See README 'Blocking' for the plan."
         )
 
     return _builder
+
+
+def _build_suffix_stripped(
+    chunks: Iterable[pd.DataFrame] | Callable[[], Iterator[pd.DataFrame]],
+    source: str,
+    prefix: str,
+    key_field: str,
+    log: Optional[logging.Logger],
+    total_rows: Optional[int],
+    **_settings: Any,
+) -> ExactNameIndex:
+    """Adapter giving the suffix-stripped build the uniform builder signature.
+
+    A suffix-stripped index IS an exact index - one derived key per entity, no df
+    cap, no rarest-K ranking - so it reuses :class:`ExactNameIndex` and differs only
+    by the key transform. Sharing the class is what keeps build, persistence and
+    query identical between the two; a separate class would be a second copy of
+    ``_verify_strings`` and the CSR expansion, and the two copies would drift.
+
+    ``key_field`` stays the *source* column the transform reads (``name_norm``), so
+    the caller needs no derived column in the prepared table.
+    """
+    return ExactNameIndex.build(
+        _chunk_factory(chunks)(),
+        source=source,
+        prefix=prefix,
+        key_field=key_field,
+        log=log,
+        total_rows=total_rows,
+        key_transform=BLOCKER_SUFFIX_STRIPPED,
+    )
 
 
 def _build_exact_name(
@@ -2192,6 +2404,7 @@ INDEX_BUILDERS = {
     BLOCKER_EXACT_NAME: _build_exact_name,
     BLOCKER_TOKEN: TokenIndex.build,
     BLOCKER_CHAR_NGRAM: CharNgramIndex.build,
+    BLOCKER_SUFFIX_STRIPPED: _build_suffix_stripped,
     BLOCKER_DENSE: _not_implemented(BLOCKER_DENSE),
 }
 
@@ -2201,6 +2414,9 @@ INDEX_LOADERS: dict[str, Callable[..., MultiKeyIndex]] = {
     BLOCKER_EXACT_NAME: ExactNameIndex.load,
     BLOCKER_TOKEN: TokenIndex.load,
     BLOCKER_CHAR_NGRAM: CharNgramIndex.load,
+    # Same class as exact_name; the persisted key_transform is what distinguishes
+    # them, so loading always restores the transform the index was built with.
+    BLOCKER_SUFFIX_STRIPPED: ExactNameIndex.load,
 }
 
 
@@ -2318,7 +2534,7 @@ def _load_index_at(directory: Path, blocker: str, log: Optional[logging.Logger] 
     loader = INDEX_LOADERS.get(blocker)
     if loader is None:
         raise NotImplementedError(
-            f"blocker {blocker!r} has no index implementation; implemented: {UNION_BLOCKERS}"
+            f"blocker {blocker!r} has no index implementation; implemented: {COMBINABLE_BLOCKERS}"
         )
     if blocker == BLOCKER_CHAR_NGRAM:
         return CharNgramIndex.load(directory, log=log, workers=workers)
@@ -2402,7 +2618,7 @@ def union_blockers(
     Returns:
         ``(s1_positions, entity_codes, blockers_per_pair, evidence)``, sorted by
         (s1_position, entity_code). ``blockers_per_pair`` is an object array of
-        comma-joined blocker names in :data:`UNION_BLOCKERS` order, so provenance
+        comma-joined blocker names in :data:`COMBINABLE_BLOCKERS` order, so provenance
         survives the union - which is what lets us audit which blocker earned its keep
         and is what the matcher will use to tell a char-only pair from an exact one.
         ``evidence`` is ``{column: float64 array}`` aligned to the output. A blocker
@@ -2427,7 +2643,10 @@ def union_blockers(
     # be bare blocker names or ``source:blocker`` labels; the blocker part decides.
     def _rank(name: str) -> tuple[int, str]:
         blocker = name.rsplit(":", 1)[-1]
-        return (UNION_BLOCKERS.index(blocker) if blocker in UNION_BLOCKERS else len(UNION_BLOCKERS), name)
+        return (
+            COMBINABLE_BLOCKERS.index(blocker) if blocker in COMBINABLE_BLOCKERS else len(COMBINABLE_BLOCKERS),
+            name,
+        )
 
     names = sorted(non_empty, key=_rank)
 

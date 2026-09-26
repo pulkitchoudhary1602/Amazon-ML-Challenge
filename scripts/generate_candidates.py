@@ -48,9 +48,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.blocking import (  # noqa: E402
     BLOCKER_EXACT_NAME,
+    COMBINABLE_BLOCKERS,
     EVIDENCE_COLUMNS,
     KNOWN_BLOCKERS,
-    UNION_BLOCKERS,
     decode_candidates,
     evidence_columns_for,
     load_index,
@@ -104,12 +104,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def enabled_blockers(config: dict, requested: str | None, log: logging.Logger) -> list[str]:
     """Blockers to run: explicit CLI list, else those enabled in config.
 
-    Always returned in :data:`UNION_BLOCKERS` order, so the run - and the per-pair
-    ``blockers`` provenance string it writes - does not depend on how the list was
-    spelled on the command line.
+    Always returned in :data:`COMBINABLE_BLOCKERS` order, so the run - and the
+    per-pair ``blockers`` provenance string it writes - does not depend on how the
+    list was spelled on the command line.
 
     An explicit ``--blockers`` list wins even for blockers the config leaves
     disabled: naming them on the command line is the more specific instruction.
+    That is also how an experimental blocker is run without touching the config, so
+    a default invocation of this script keeps producing the production union.
     """
     blocking = config.get("blocking", {})
     if requested:
@@ -117,9 +119,9 @@ def enabled_blockers(config: dict, requested: str | None, log: logging.Logger) -
         unknown = [b for b in named if b not in KNOWN_BLOCKERS]
         if unknown:
             raise ValueError(f"unknown blocker(s) {unknown}; expected from {KNOWN_BLOCKERS}")
-        return [b for b in UNION_BLOCKERS if b in set(named)]
+        return [b for b in COMBINABLE_BLOCKERS if b in set(named)]
 
-    active = [b for b in UNION_BLOCKERS if (blocking.get(b, {}) or {}).get("enabled", False)]
+    active = [b for b in COMBINABLE_BLOCKERS if (blocking.get(b, {}) or {}).get("enabled", False)]
     if active:
         return active
     log.warning("no blocker is enabled in config; falling back to %s", BLOCKER_EXACT_NAME)
