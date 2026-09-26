@@ -1,0 +1,267 @@
+diff --git a/scripts/analyze_blocking_errors.py b/scripts/analyze_blocking_errors.py
+index 51a3c57..24455fa 100644
+--- a/scripts/analyze_blocking_errors.py
++++ b/scripts/analyze_blocking_errors.py
+@@ -8,10 +8,13 @@ candidate file, no feature definition and no config value is touched.
+ What it answers
+ ---------------
+ 1. **Blocker contribution.** For every ground-truth pair, which blocker retrieved it -
+-   exact name, token, char n-gram, or a combination? Reported per blocker and over all
+-   seven non-empty combinations, from the ``blockers`` provenance column the union
++   exact name, token, char n-gram, or a combination? Reported per blocker and over every
++   non-empty combination, from the ``blockers`` provenance column the union
+    already writes. Per-blocker candidate volume is reported alongside, because a recall
+-   figure without the candidate rows it cost is not a decision.
++   figure without the candidate rows it cost is not a decision. ``--blockers`` selects
++   which provenance labels count as blockers, so a union that includes the optional
++   ``suffix_stripped`` blocker is attributed to all four rather than silently folded
++   into the three that the production default knows about.
+ 2. **Missed pairs.** The ground-truth pairs no blocker retrieved, characterised by the
+    same pair features the matcher sees - recomputed here from the prepared tables,
+    because by definition these pairs are absent from the feature file.
+@@ -67,7 +70,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ from src.blocking import (  # noqa: E402
+     BLOCKER_CHAR_NGRAM,
+     BLOCKER_EXACT_NAME,
++    BLOCKER_SUFFIX_STRIPPED,
+     BLOCKER_TOKEN,
++    COMBINABLE_BLOCKERS,
++    OPTIONAL_BLOCKERS,
+     PAIR_MULTIPLIER,
+     UNION_BLOCKERS,
+     _trigram_jaccard,
+@@ -129,26 +135,62 @@ MISSED_COLUMNS = (
+     COUNTRY_NORM,
+ )
+ 
+-# The seven non-empty subsets of the three production blockers, as a bitmask so the
+-# combination histogram is one ``bincount``. Order matches UNION_BLOCKERS.
++# The non-empty subsets of the ACTIVE blockers, as a bitmask so the combination
++# histogram is one ``bincount``. Order matches :data:`ACTIVE_BLOCKERS`.
++#
++# ``ACTIVE_BLOCKERS`` defaults to :data:`UNION_BLOCKERS`, so a production run keeps every
++# label, array size and table byte-identical. ``--blockers`` widens it - in practice to
++# add ``suffix_stripped`` when the candidate file under analysis was generated with that
++# blocker enabled. Reading a four-blocker file with the three-blocker default is not a
++# neutral mistake: every pair only ``suffix_stripped`` retrieved would be counted as
++# "no recognised blocker", so ``missed_pairs`` would report it as lost, and each of the
++# other three would independently claim it under
++# ``pairs_union_would_lose_without_it`` - a threefold over-count of an increment that
++# belongs to somebody else.
++ACTIVE_BLOCKERS: tuple[str, ...] = tuple(UNION_BLOCKERS)
++
++_ALL_LABELS = {3: "all_three", 4: "all_four"}
++
+ _BLOCKER_BITS = {
+     BLOCKER_EXACT_NAME: 1,
+     BLOCKER_TOKEN: 2,
+     BLOCKER_CHAR_NGRAM: 4,
++    BLOCKER_SUFFIX_STRIPPED: 8,
+ }
+ 
+ 
++def n_combinations() -> int:
++    """Number of bitmask values, i.e. ``2 ** len(ACTIVE_BLOCKERS)``."""
++    return 1 << len(ACTIVE_BLOCKERS)
++
++
++def all_label() -> str:
++    """Label for the provenance combination that holds every active blocker."""
++    return _ALL_LABELS.get(len(ACTIVE_BLOCKERS), "all")
++
++
++def set_active_blockers(labels: Sequence[str]) -> None:
++    """Set the blocker set provenance is attributed to. Validated by the caller."""
++    global ACTIVE_BLOCKERS
++    ACTIVE_BLOCKERS = tuple(labels)
++
++
+ def combination_label(mask: int) -> str:
+     """Render a provenance bitmask as ``exact+token`` / ``char_ngram`` / ``union``."""
+-    names = [b for b, bit in _BLOCKER_BITS.items() if mask & bit]
++    names = [b for b in ACTIVE_BLOCKERS if mask & _BLOCKER_BITS[b]]
+     if not names:
+         return "none"
+-    if len(names) == len(UNION_BLOCKERS):
+-        return "all_three"
++    if len(names) == len(ACTIVE_BLOCKERS):
++        return all_label()
+     return "+".join(names)
+ 
+ 
+-COMBINATION_ORDER = tuple(combination_label(mask) for mask in range(1, 8))
++def combination_order() -> tuple[str, ...]:
++    """Every non-empty provenance combination over the active blockers, in bitmask order."""
++    return tuple(combination_label(mask) for mask in range(1, n_combinations()))
++
++
++COMBINATION_ORDER = combination_order()
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -163,7 +205,7 @@ def provenance_flags(provenance: pd.Series) -> dict[str, np.ndarray]:
+     substring test is exact rather than approximate.
+     """
+     text = provenance.fillna("").astype(str)
+-    return {label: text.str.contains(f":{label}", regex=False).to_numpy() for label in UNION_BLOCKERS}
++    return {label: text.str.contains(f":{label}", regex=False).to_numpy() for label in ACTIVE_BLOCKERS}
+ 
+ 
+ def scan_candidates(
+@@ -185,21 +227,22 @@ def scan_candidates(
+     n_entities = ground_truth.n_entities
+     lengths = ground_truth.lengths()
+ 
+-    flags_total = {label: 0 for label in UNION_BLOCKERS}
+-    flags_by_source: dict[str, dict[int, int]] = {label: {2: 0, 3: 0} for label in UNION_BLOCKERS}
++    n_slots = n_combinations()
++    flags_total = {label: 0 for label in ACTIVE_BLOCKERS}
++    flags_by_source: dict[str, dict[int, int]] = {label: {2: 0, 3: 0} for label in ACTIVE_BLOCKERS}
+     rows_by_entity = np.zeros(n_entities, dtype=np.int64)
+-    rows_by_entity_blocker = {label: np.zeros(n_entities, dtype=np.int64) for label in UNION_BLOCKERS}
++    rows_by_entity_blocker = {label: np.zeros(n_entities, dtype=np.int64) for label in ACTIVE_BLOCKERS}
+     recovered = np.zeros(len(true_pair_codes), dtype=bool)
+-    recovered_by_blocker = {label: np.zeros(len(true_pair_codes), dtype=bool) for label in UNION_BLOCKERS}
+-    combination_counts = np.zeros(8, dtype=np.int64)
+-    combination_counts_by_source = {2: np.zeros(8, dtype=np.int64), 3: np.zeros(8, dtype=np.int64)}
+-    row_combination_counts = np.zeros(8, dtype=np.int64)
++    recovered_by_blocker = {label: np.zeros(len(true_pair_codes), dtype=bool) for label in ACTIVE_BLOCKERS}
++    combination_counts = np.zeros(n_slots, dtype=np.int64)
++    combination_counts_by_source = {2: np.zeros(n_slots, dtype=np.int64), 3: np.zeros(n_slots, dtype=np.int64)}
++    row_combination_counts = np.zeros(n_slots, dtype=np.int64)
+     # The two histograms above are global. These two are the same facts kept per key, so
+     # a table restricted to a split can mask its numerator *and* its denominator. Without
+     # them a `--split val` table would divide val recall by all-split volume, which reads
+     # as a recall above 1.0 - the kind of mixed-scope number that misdirects a decision.
+     pair_combination = np.zeros(len(true_pair_codes), dtype=np.uint8)
+-    row_combination_by_entity = np.zeros((8, n_entities), dtype=np.int64)
++    row_combination_by_entity = np.zeros((n_slots, n_entities), dtype=np.int64)
+ 
+     rows_seen = 0
+     unknown_s1 = 0
+@@ -247,7 +290,8 @@ def scan_candidates(
+         source_codes = (target_codes // 10**10).astype(np.int64)
+         bitmask = np.zeros(len(owners), dtype=np.int64)
+         any_flag = np.zeros(len(owners), dtype=bool)
+-        for label, bit in _BLOCKER_BITS.items():
++        for label in ACTIVE_BLOCKERS:
++            bit = _BLOCKER_BITS[label]
+             values = flags[label]
+             bitmask |= np.where(values, bit, 0)
+             any_flag |= values
+@@ -263,17 +307,17 @@ def scan_candidates(
+         # Row-level combinations answer "how much volume does each blocker propose
+         # alone" - the question a removal or a retune actually turns on. Pair-level
+         # combinations (below) answer "what did each blocker contribute to recall".
+-        row_combination_counts += np.bincount(bitmask, minlength=8)
++        row_combination_counts += np.bincount(bitmask, minlength=n_slots)
+         np.add.at(row_combination_by_entity, (bitmask, owners), 1)
+ 
+         if is_true.any():
+             recovered[position[is_true]] = True
+-            combination_counts += np.bincount(bitmask[is_true], minlength=8)
++            combination_counts += np.bincount(bitmask[is_true], minlength=n_slots)
+             pair_combination[position[is_true]] = bitmask[is_true].astype(np.uint8)
+             for source_code in (2, 3):
+                 in_source = is_true & (source_codes == source_code)
+                 if in_source.any():
+-                    combination_counts_by_source[source_code] += np.bincount(bitmask[in_source], minlength=8)
++                    combination_counts_by_source[source_code] += np.bincount(bitmask[in_source], minlength=n_slots)
+ 
+         if has_evidence:
+             # na_filter=False throughout iter_tsv, so absence is the empty string, not NaN.
+@@ -287,6 +331,14 @@ def scan_candidates(
+                 fmt_int(int(recovered.sum())),
+             )
+ 
++    for label in ACTIVE_BLOCKERS:
++        if not flags_total[label]:
++            log.warning(
++                "blocker %r is active but no candidate row carries it; either the file was "
++                "generated without it, or --blockers does not match the file that was generated",
++                label,
++            )
++
+     log.info("candidate scan: %s rows in %.1f min", fmt_int(rows_seen), (time.time() - started) / 60.0)
+     if unknown_s1:
+         log.warning("%s candidate rows name an S1 entity absent from the ground truth", fmt_int(unknown_s1))
+@@ -350,13 +402,13 @@ def blocker_table(scan: dict[str, Any], mask: np.ndarray, n_rows_total: int) ->
+     if n_true == 0:
+         return []
+ 
+-    singles = {label: scan["recovered_by_blocker"][label][pair_mask] for label in UNION_BLOCKERS}
++    singles = {label: scan["recovered_by_blocker"][label][pair_mask] for label in ACTIVE_BLOCKERS}
+     in_scope_rows = int(scan["rows_by_entity"][mask].sum())
+     rows = []
+-    for label in UNION_BLOCKERS:
++    for label in ACTIVE_BLOCKERS:
+         alone = singles[label]
+         others = np.zeros_like(alone)
+-        for other in UNION_BLOCKERS:
++        for other in ACTIVE_BLOCKERS:
+             if other != label:
+                 others |= singles[other]
+         bit = _BLOCKER_BITS[label]
+@@ -380,7 +432,7 @@ def blocker_table(scan: dict[str, Any], mask: np.ndarray, n_rows_total: int) ->
+ 
+ 
+ def combination_table(scan: dict[str, Any], mask: np.ndarray) -> list[dict[str, Any]]:
+-    """Recall and volume for each of the seven non-empty provenance combinations.
++    """Recall and volume for each non-empty provenance combination over the active blockers.
+ 
+     Reads as: ``char_ngram`` alone carries most of the recall, ``exact_name`` is nearly
+     subsumed by it, and ``all_three`` is the redundant middle. ``rows`` here is the
+@@ -392,7 +444,7 @@ def combination_table(scan: dict[str, Any], mask: np.ndarray) -> list[dict[str,
+     pairs_in_scope = scan["pair_combination"][pair_mask]
+     row_counts = scan["row_combination_by_entity"][:, mask].sum(axis=1)
+     rows = []
+-    for mask_value in range(1, 8):
++    for mask_value in range(1, n_combinations()):
+         n_pairs = int((pairs_in_scope == mask_value).sum())
+         n_rows = int(row_counts[mask_value])
+         rows.append(
+@@ -1385,8 +1437,9 @@ def run_analysis(args: argparse.Namespace, config: dict, log: logging.Logger) ->
+             "flags_total": scan["flags_total"],
+             "flags_by_source": scan["flags_by_source"],
+             "combination_counts": scan["combination_counts"].tolist(),
+-            "combination_labels": list(COMBINATION_ORDER) + ["all_three", "none"],
++            "combination_labels": list(combination_order()) + [all_label(), "none"],
+         },
++        "active_blockers": list(ACTIVE_BLOCKERS),
+         "blockers": list(blockers),
+         "combinations": list(combinations),
+         "entity": {key: value for key, value in entity.items() if not key.startswith("per_entity")},
+@@ -1639,6 +1692,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+     parser.add_argument("--data-root", default=None)
+     parser.add_argument("--work-dir", default=None)
+     parser.add_argument("--candidates", default=None, help="candidate TSV path (default: <candidates_dir>/candidate_pairs.tsv)")
++    parser.add_argument(
++        "--blockers",
++        default=None,
++        help=(
++            "comma-separated provenance blockers to attribute, matching the --blockers the "
++            "candidate file was generated with. Default: the three production blockers "
++            f"({','.join(UNION_BLOCKERS)}). Pass {','.join(UNION_BLOCKERS + OPTIONAL_BLOCKERS)} "
++            "for a four-blocker file, or every pair the optional blocker retrieved is counted "
++            "as retrieved by nobody"
++        ),
++    )
+     parser.add_argument("--output-dir", default="outputs/experiments/blocking_error_analysis")
+     parser.add_argument(
+         "--split",
+@@ -1680,6 +1744,15 @@ def main(argv: Optional[list[str]] = None) -> int:
+     log.info("=" * 78)
+     log.info("analyze_blocking_errors: offline blocking error analysis")
+     log.info(describe_environment(config))
++    if args.blockers:
++        requested = tuple(name.strip() for name in args.blockers.split(",") if name.strip())
++        unknown = [name for name in requested if name not in COMBINABLE_BLOCKERS]
++        if unknown:
++            raise SystemExit(
++                f"unknown blocker(s): {', '.join(unknown)}; known: {', '.join(COMBINABLE_BLOCKERS)}"
++            )
++        set_active_blockers(requested)
++    log.info("provenance blockers: %s", ", ".join(ACTIVE_BLOCKERS))
+     log.info("=" * 78)
+     if args.limit_rows:
+         log.warning("--limit-rows is set: every number describes a prefix of the candidate file")

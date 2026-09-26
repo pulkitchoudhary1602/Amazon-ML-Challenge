@@ -20,6 +20,15 @@ chunks), and the per-S1 row count in the sample agrees with the count phase 1
 recorded. The agreement check is the whole-entity invariant, and it is exercised
 directly by corrupting the sample file.
 
+And it guards the *entity accounting*, which is the fix for the bug where
+``--split test`` silently discarded the ~80% of test entities whose id hashes to
+"train". ``assign_splits`` labels any id at all, including a test-split id, so the
+old unconditional validation filter dropped real test entities with real candidate
+pairs. The tests below pin both halves: that the filter still does that when it is
+asked for (so the test is not vacuous), that the default on ``--split test`` no
+longer asks for it, and that a feature table short of the entities the scan
+selected fails the run instead of being reported as a completed one.
+
 There is no ground-truth file anywhere in this fixture, deliberately: the split
 comes from ``assign_splits``, the same pure function ``src/evaluation.py`` uses,
 so nothing here can leak a label into a feature.
@@ -76,6 +85,10 @@ CANDIDATE_COLUMNS = [
 # fixture
 # ---------------------------------------------------------------------------
 N_S1 = 60
+# How many of the fixture's S1 entities the TEST candidate file mentions. The rest
+# have no candidate pairs at all, which is the population the accounting must keep
+# separate from "dropped".
+TEST_COVERED_S1 = 40
 S2_NAMES = {"S2-1": "acme alpha limited", "S2-2": "acme beta limited",
             "S2-3": "acme gamma limited"}
 S3_NAMES = {"S3-1": "acme delta limited"}
@@ -149,6 +162,30 @@ def _fixture_candidate_rows() -> list[tuple]:
     return rows
 
 
+def _test_split_candidate_rows(n_with_candidates: int) -> list[tuple]:
+    """Candidate rows for the TEST split: a subset of the S1 entities, both kinds.
+
+    ``n_with_candidates`` entities get candidate pairs and the rest get none at all,
+    so the fixture has the two populations the accounting has to tell apart: S1
+    entities the candidate file mentions, and S1 entities it does not mention
+    because the blockers found nothing for them.
+
+    Each covered entity gets a pair that joins to the prepared text (a positive in
+    the only sense this stage has one) and a pair whose target id is absent from the
+    prepared files (a join failure - kept, with its text features blanked). Entity 0
+    also gets a duplicated pair, because a duplicate is a row-level count the
+    accounting must not confuse with an entity-level one.
+    """
+    rows = []
+    for index in range(n_with_candidates):
+        entity_id = f"S1-{index}"
+        rows.append((entity_id, "S2-1", "S2", "source2:exact_name", "3", ""))
+        rows.append((entity_id, "S9-404", "S2", "source2:token", "5", ""))
+        if index == 0:
+            rows.append((entity_id, "S2-1", "S2", "source2:exact_name", "3", ""))
+    return rows
+
+
 def _write_fixture(root: Path) -> Path:
     prepared = root / "prepared"
     candidates = root / "candidates"
@@ -156,7 +193,8 @@ def _write_fixture(root: Path) -> Path:
         path.mkdir(parents=True, exist_ok=True)
 
     s1_rows = [_s1_row(index) for index in range(N_S1)]
-    _prepared_frame(s1_rows).to_csv(prepared / "train_source1_norm.tsv", sep="\t", index=False)
+    s1_frame = _prepared_frame(s1_rows)
+    s1_frame.to_csv(prepared / "train_source1_norm.tsv", sep="\t", index=False)
     _prepared_frame([_text_row("S2-1", S2_NAMES["S2-1"], "1 main st bengaluru", "in"),
                      _text_row("S2-2", S2_NAMES["S2-2"], "", ""),
                      _text_row("S2-3", S2_NAMES["S2-3"], "1 main st bengaluru", "in")]).to_csv(
@@ -168,6 +206,38 @@ def _write_fixture(root: Path) -> Path:
 
     pd.DataFrame(_fixture_candidate_rows(), columns=CANDIDATE_COLUMNS).to_csv(
         candidates / "candidate_pairs.tsv", sep="\t", index=False
+    )
+
+    # ---- the test split, for the entity-scope regression test ----------------
+    # The same S1 entities with the same text, so the only difference between the
+    # two splits is which candidate file is read. The test candidate file covers
+    # TEST_COVERED_S1 of them and says nothing about the rest.
+    s1_frame.to_csv(prepared / "test_source1_norm.tsv", sep="\t", index=False)
+    for source in ("source2", "source3"):
+        shutil.copyfile(prepared / f"train_{source}_norm.tsv", prepared / f"test_{source}_norm.tsv")
+    pd.DataFrame(
+        _test_split_candidate_rows(TEST_COVERED_S1), columns=CANDIDATE_COLUMNS
+    ).to_csv(candidates / "candidate_pairs_test.tsv", sep="\t", index=False)
+
+    # A prepare manifest, so the accounting's ``n_s1_input`` has a real source
+    # instead of falling back to "unknown". It only ever describes files that exist.
+    (prepared / "prepare_manifest.json").write_text(
+        json.dumps(
+            {
+                "sources": [
+                    {"split": split, "source": source, "rows": rows}
+                    for split, source, rows in (
+                        ("train", "source1", N_S1),
+                        ("train", "source2", len(S2_NAMES)),
+                        ("train", "source3", len(S3_NAMES)),
+                        ("test", "source1", N_S1),
+                        ("test", "source2", len(S2_NAMES)),
+                        ("test", "source3", len(S3_NAMES)),
+                    )
+                ]
+            }
+        ),
+        encoding="utf-8",
     )
 
     config_path = root / "config.yaml"
@@ -715,6 +785,232 @@ def test_sample_is_exactly_the_val_entities():
         assert sample[epf.CANDIDATE_S1_COLUMN].value_counts().to_dict() == (
             expected[epf.CANDIDATE_S1_COLUMN].value_counts().to_dict()
         )
+    finally:
+        fixture.close()
+
+
+def test_test_split_keeps_every_entity_that_has_candidates():
+    """The regression: ``--split test`` must not apply the validation-entity filter.
+
+    This is the failure the entity accounting exists to catch, reproduced on a
+    fixture small enough to reason about. ``assign_splits`` labels *any* id val or
+    train, including a test-split id, so the old unconditional ``keep = is_val & ...``
+    discarded the ~80% of test entities that hashed to "train" - entities with real
+    candidate pairs, whose rows belong in the test feature table and whose absence
+    would have produced a submission covering a fifth of the test set.
+
+    Both halves are asserted: that the filter really does drop most entities when it
+    is asked for (so the test is not vacuous), and that the default no longer asks
+    for it on the test split. The last block is the accounting, and it is the one
+    that would have failed loudly on the old code.
+    """
+    fixture = _fixture()
+    try:
+        n_covered = TEST_COVERED_S1
+        n_uncovored = N_S1 - n_covered
+        candidates = pd.read_csv(
+            fixture.root / "candidates" / "candidate_pairs_test.tsv", sep="\t", dtype=str
+        )
+        covered = {f"S1-{index}" for index in range(n_covered)}
+        in_val = _val_ids()
+        val_covered = covered & in_val
+        # The fixture is only meaningful if the two halves of the split are both
+        # non-empty; otherwise "the old path dropped entities" cannot be shown.
+        assert 0 < len(val_covered) < n_covered
+
+        # --- the old behaviour, asked for explicitly: most entities are dropped ---
+        code, filtered = fixture.run_into(
+            fixture.root / "out_filtered", split="test", entities="val",
+            candidates="candidate_pairs_test", sample_fraction=1.0,
+        )
+        assert code == 0
+        assert filtered["accounting"]["restrict_to_split"] is True
+        assert filtered["accounting"]["n_s1_with_candidates"] == n_covered
+        assert filtered["accounting"]["n_s1_represented_in_features"] == len(val_covered)
+        assert filtered["accounting"]["entities_excluded_by_split"] == n_covered - len(val_covered)
+        # ... and it is a real loss of rows, not just of bookkeeping.
+        assert len(pd.read_csv(fixture.root / "out_filtered" / "features.tsv", sep="\t",
+                               dtype=str)) < len(candidates)
+
+        # --- the default on the test split: nothing is dropped for the split's sake ---
+        code, report = fixture.run_into(
+            fixture.root / "out_test", split="test",
+            candidates="candidate_pairs_test", sample_fraction=1.0,
+        )
+        assert code == 0
+        accounting = report["accounting"]
+
+        assert accounting["restrict_to_split"] is False
+        assert accounting["entity_scope"] == "auto"
+        assert accounting["n_s1_input"] == N_S1
+        assert accounting["n_s1_with_candidates"] == n_covered
+        assert accounting["entities_excluded_by_split"] == 0
+        assert accounting["entities_excluded_by_bucket"] == 0
+        assert accounting["n_s1_represented_in_features"] == n_covered
+        assert accounting["n_candidate_pairs_input"] == len(candidates)
+        assert accounting["n_candidate_pairs_output"] == len(candidates)
+        assert accounting["ok"] is True
+        assert report["inputs"]["restrict_to_split"] is False
+
+        # The entities the candidate file never mentions are not "dropped" - the file
+        # does not have them - and they are simply absent, not half-represented. The
+        # counters add up over the file's population, and the difference to the
+        # split's own population is exactly the entities with no candidates.
+        assert accounting["n_s1_represented_in_features"] + n_uncovored == accounting["n_s1_input"]
+
+        features = pd.read_csv(fixture.root / "out_test" / "features.tsv", sep="\t", dtype=str)
+        assert set(features[epf.CANDIDATE_S1_COLUMN]) == covered
+        # Both pair kinds survived: the one that joins to prepared text and the one
+        # whose target id is absent (a kept row with its text features blanked).
+        assert set(features[epf.CANDIDATE_TARGET_COLUMN]) == {"S2-1", "S9-404"}
+        assert len(features) == len(candidates)
+        joined = features[features[epf.CANDIDATE_TARGET_COLUMN] == "S2-1"]
+        blanked = features[features[epf.CANDIDATE_TARGET_COLUMN] == "S9-404"]
+        assert joined["text_join_ok"].eq("1").all()
+        assert blanked["text_join_ok"].eq("0").all()
+
+        # ``--entities all`` is the same run on this split: there is no split filter
+        # to skip. It exists for the training split / a full-population run. The two
+        # commands differ only in the scope they were told to use, which is the whole
+        # point - on the test split they select the same entities.
+        code, explicit = fixture.run_into(
+            fixture.root / "out_all", split="test", entities="all",
+            candidates="candidate_pairs_test", sample_fraction=1.0,
+        )
+        assert code == 0
+        assert explicit["accounting"]["entity_scope"] == "all"
+        assert {
+            key: value for key, value in explicit["accounting"].items() if key != "entity_scope"
+        } == {
+            key: value for key, value in accounting.items() if key != "entity_scope"
+        }
+    finally:
+        fixture.close()
+
+
+def test_train_split_still_samples_validation_entities_only():
+    """The conditional filter must not have loosened the training split.
+
+    The matcher's validation macro F0.5 is out-of-fold only because the feature file
+    holds validation entities and nothing else. ``--entities auto`` on
+    ``--split train`` is the old behaviour, and this pins it as such - including that
+    an explicit ``--entities all`` on the training split is what would break it.
+    """
+    fixture = _fixture()
+    try:
+        code, report = fixture.run(sample_fraction=1.0)
+        assert code == 0
+        assert report["accounting"]["restrict_to_split"] is True
+        assert report["accounting"]["entity_scope"] == "auto"
+        assert set(fixture.sample()[epf.CANDIDATE_S1_COLUMN]) == _val_ids()
+        # The training split's candidate file covers every S1, so the entities that
+        # are excluded are excluded by the split filter and nothing else.
+        assert report["accounting"]["n_s1_with_candidates"] == N_S1
+        assert report["accounting"]["entities_excluded_by_bucket"] == 0
+        assert (
+            report["accounting"]["n_s1_represented_in_features"]
+            + report["accounting"]["entities_excluded_by_split"]
+            == N_S1
+        )
+        assert report["accounting"]["ok"] is True
+    finally:
+        fixture.close()
+
+
+def test_accounting_fails_loudly_on_a_corrupt_sample():
+    """A feature table short of the entities the scan selected must be reported.
+
+    The accounting is only worth having if it fails the run. This drops every row of
+    one entity from the sample *between* the two phases - the exact shape of the bug
+    being guarded against, a whole entity silently missing from the feature table -
+    and requires the report to say so and ``main``'s check to name it, rather than
+    producing a report that looks complete.
+
+    Phase 1 has to be driven directly rather than through ``main``: ``main`` would
+    re-scan and rewrite the sample, which is also why this cannot be a
+    corrupt-the-file-then-run-the-CLI test.
+    """
+    fixture = _fixture()
+    try:
+        out_dir = fixture.out
+        args = fixture.args(sample_fraction=1.0)
+        config = fixture.config
+
+        scan = epf.scan_and_sample(config, args, out_dir, fixture.log)
+        assert scan["accounting"]["ok"] is True
+
+        sample_path = scan["sample_path"]
+        sample = pd.read_csv(sample_path, sep="\t", dtype=str)
+        victim = sorted(sample[epf.CANDIDATE_S1_COLUMN].unique())[0]
+        sample[sample[epf.CANDIDATE_S1_COLUMN] != victim].to_csv(
+            sample_path, sep="\t", index=False
+        )
+
+        features = epf.extract_features(config, args, scan, out_dir, fixture.log)
+        report = epf.summarize(features, scan, 0.0, fixture.log)
+        report["inputs"] = {"split": args.split, "entities": args.entities}
+
+        accounting = report["accounting"]
+        assert accounting["ok"] is False
+        assert accounting["represented_entities_agree"] is False
+        assert (
+            accounting["n_s1_represented_in_feature_file"]
+            == accounting["n_s1_represented_in_features"] - 1
+        )
+        # The scan is not what failed - it counted the entity - so the entity
+        # counters still add up. It is the written file that is short.
+        assert accounting["entity_count_matches_stream"] is True
+        assert accounting["entities_account_for_all"] is True
+        # This is the check ``main`` turns into a non-zero exit.
+        assert "represented_entities_agree" in epf.accounting_failures(report)
+
+        # And the guard is not vacuously true: a healthy report names no failures.
+        code, healthy = fixture.run_into(out_dir / "healthy", sample_fraction=1.0)
+        assert code == 0
+        assert epf.accounting_failures(healthy) == {}
+    finally:
+        fixture.close()
+
+
+def test_main_exits_non_zero_when_the_accounting_fails():
+    """The exit path itself: a failing accounting block must make ``main`` return 1.
+
+    ``test_accounting_fails_loudly_on_a_corrupt_sample`` proves the report detects a
+    lost entity; this proves the detection is wired to the exit code, which is what
+    makes it a guard rather than a note in a JSON file. ``summarize`` is stubbed with
+    a report whose accounting disagrees, so the assertion is about ``main``'s branch
+    and nothing else - the health of the rest of the run is not in question, and a
+    real run's own report is used as the template so every key the branch reads is
+    present with the shape it really has.
+    """
+    fixture = _fixture()
+    try:
+        code, healthy = fixture.run(sample_fraction=1.0)
+        assert code == 0
+
+        broken = json.loads(json.dumps(healthy))
+        broken["accounting"]["n_s1_represented_in_features"] -= 1
+        broken["accounting"]["represented_entities_agree"] = False
+        broken["accounting"]["ok"] = False
+
+        real_summarize = epf.summarize
+        epf.summarize = lambda *args, **kwargs: broken
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                code = epf.main(fixture.argv(sample_fraction=1.0))
+        finally:
+            epf.summarize = real_summarize
+
+        assert code == 1
+        # Read the run's own log rather than a redirected stream: ``setup_logging``
+        # attaches its stream handler to ``sys.stderr`` at first call, so a redirect
+        # installed afterwards would not see it, and the log file is what a user on
+        # the node actually reads. Exactly one occurrence, because the healthy run
+        # earlier in this test shares the file and must not have logged it - which is
+        # also what keeps this test from passing on a message it did not provoke.
+        emitted = (fixture.out / f"{epf.LOG_NAME}.log").read_text(encoding="utf-8")
+        assert emitted.count("ACCOUNTING FAILURE") == 1
+        assert "represented_entities_agree" in emitted
     finally:
         fixture.close()
 

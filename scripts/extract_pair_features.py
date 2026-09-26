@@ -15,6 +15,33 @@ It deliberately does NOT:
   ``assign_splits`` - the same pure function ``src/evaluation.py`` uses - so no
   label can leak into a feature and the split cannot drift from the evaluator's.
 
+Which entities are in scope, and why the split filter is conditional
+--------------------------------------------------------------------
+"Sample the validation entities" (the training run) and "cover the population"
+(the test run) are two different jobs, and they used to share one code path that
+made the second job silently drop most of its entities. On ``--split test`` the
+old path still asked ``assign_splits`` whether an id was validation, and
+``assign_splits`` answers for *any* id - so ~80% of the test entities, which have
+real candidate pairs and belong in the submission, were filtered out no matter
+what ``--sample-fraction`` said.
+
+``--entities`` now names the job explicitly, and the report carries the counters
+that prove which job ran:
+
+* ``auto`` (default) - ``--split train`` keeps validation entities only. This is
+  load-bearing, not a convenience: the matcher's reported validation macro F0.5 is
+  out-of-fold only because the feature file holds validation entities and nothing
+  else. ``--split test`` keeps every entity that has candidates, because the test
+  split has no ground truth for ``assign_splits`` to be right about.
+* ``val`` - force the validation filter whatever the split.
+* ``all`` - no split filter at all: every entity with candidates, minus
+  ``--sample-fraction``. This is what a full-population run wants.
+
+Entities with **no** candidate pairs never appear in the candidate file, so they
+cannot appear in the feature table. That is expected, and the report accounts for
+it separately rather than letting it hide. Restoring them for scoring is
+``matching_model.aggregate_matches(..., s1_universe=...)``, not this script's job.
+
 Why a two-phase design
 ----------------------
 ``s1_candidate_count`` is one of the most valuable features in the first matcher
@@ -37,6 +64,7 @@ would silently corrupt the feature, and the run fails rather than reporting it.
     python scripts/extract_pair_features.py --sample-fraction 0.05
     python scripts/extract_pair_features.py --workers 8               # 8 shards
     python scripts/extract_pair_features.py --limit-rows 200000        # smoke test
+    python scripts/extract_pair_features.py --split test --sample-fraction 1.0 --entities all
 
 Parallel execution (``--workers N``)
 -----------------------------------
@@ -138,6 +166,7 @@ from src.utils import (  # noqa: E402
     human_bytes,
     log_memory,
     peak_rss_bytes,
+    read_json,
     set_seed,
     setup_logging,
     stable_hash64,
@@ -184,6 +213,26 @@ DEFAULT_WORKERS = 1
 
 # Where the per-worker shard, log and feature files live, inside --output-dir.
 WORKER_DIR_NAME = "workers"
+
+# Which S1 entities a run is allowed to emit rows for.
+#
+# This exists because "sample the validation entities" and "cover the population"
+# are two different jobs that used to share one code path, and the shared path made
+# the second job silently drop ~80% of its entities.
+#
+#   auto -> the split decides. The training split samples VALIDATION entities, which
+#           is what keeps the matcher's val estimate out-of-fold (the feature file
+#           holds the evaluation population and nothing else). The test split has no
+#           ground truth and no val/train distinction to make, so it takes EVERY
+#           entity that has candidates - the whole population is what gets predicted.
+#   val  -> force the validation-entity filter, whatever the split. For a training
+#           run that wants the old behaviour spelled out.
+#   all  -> no split filter at all: every entity with candidates, subject only to
+#           --sample-fraction. This is what a full-population run needs.
+ENTITY_SCOPE_AUTO = "auto"
+ENTITY_SCOPE_VAL = "val"
+ENTITY_SCOPE_ALL = "all"
+ENTITY_SCOPES = (ENTITY_SCOPE_AUTO, ENTITY_SCOPE_VAL, ENTITY_SCOPE_ALL)
 
 # Evidence columns carried by the candidate file, and the dtypes to parse them as.
 # A blank means "the blocker that measures this value did not propose this pair",
@@ -472,22 +521,83 @@ def load_lookup(
 # ---------------------------------------------------------------------------
 # phase 1: sample S1 entities out of the candidate file
 # ---------------------------------------------------------------------------
-def _sample_mask_for_ids(
+def s1_population_size(config: dict, split: str, log: logging.Logger) -> Optional[int]:
+    """How many S1 entities the split has, from the prepare manifest.
+
+    Returns ``None`` when the manifest is absent or does not describe this split.
+    ``None`` is deliberate: the alternative is counting rows in a 500MB prepared
+    file, and an accounting check is not worth a second full pass. The caller
+    reports the counter as unknown rather than inventing a number.
+
+    The prepared source1 table holds exactly one row per S1 entity, so its row
+    count is the entity count.
+    """
+    manifest_path = Path(config["resolved"]["prepared_dir"]) / "prepare_manifest.json"
+    if not manifest_path.is_file():
+        log.info("no prepare_manifest.json; S1 population size will be reported as unknown")
+        return None
+    try:
+        manifest = read_json(manifest_path)
+    except Exception as error:  # pragma: no cover - a corrupt manifest is not fatal here
+        log.warning("could not read %s (%s); S1 population size unknown", manifest_path, error)
+        return None
+    for entry in manifest.get("sources", []):
+        if entry.get("split") == split and entry.get("source") == "source1":
+            return int(entry["rows"])
+    return None
+
+
+def resolve_entity_scope(split: str, entities: str) -> bool:
+    """Whether the validation-entity filter applies, from ``--split``/``--entities``.
+
+    Returns ``restrict_to_split``. The only case that is not simply "did the caller
+    name a scope" is ``auto``, and it is the important one:
+
+    * ``split == "train"`` -> filter to validation entities. Load-bearing: the
+      matcher's reported validation macro F0.5 is an out-of-fold number only because
+      the feature file contains validation entities and nothing else. Emitting train
+      entities here would put the rows the model is fitted on into the file the
+      validation metric is read from.
+    * ``split == "test"`` -> no filter. The test split has no ground truth, so
+      ``assign_splits`` has nothing meaningful to say about it: it would still label
+      test ids "val"/"train" from their hash and discard the ``1 - val_fraction`` of
+      entities that hashed to "train". Those entities have real candidate pairs and
+      are part of the population that must be predicted, so dropping them would
+      produce a submission that silently omits most of the test set.
+    """
+    if entities == ENTITY_SCOPE_VAL:
+        return True
+    if entities == ENTITY_SCOPE_ALL:
+        return False
+    return split == "train"
+
+
+def _sample_decisions(
     unique_ids: np.ndarray,
     cache: dict[str, int],
     config: dict,
     sub_threshold: int,
-    log: logging.Logger,
-) -> np.ndarray:
-    """Which of ``unique_ids`` are in the sample. Pure function of the id.
+    restrict_to_split: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``(in_split, in_bucket)`` for ``unique_ids``. Pure function of the id.
 
     Two conditions, both deterministic functions of the S1 id and nothing else:
-    the entity must be in the validation split (``assign_splits``, the same
-    function ``src/evaluation.py`` uses), and it must fall below
+    whether the entity is in the validation split (``assign_splits``, the same
+    function ``src/evaluation.py`` uses), and whether it falls below
     ``sub_threshold`` in a second bucket taken from the high bits of the same
-    64-bit hash. Because both are functions of the id alone, every candidate row
-    of an entity makes the same decision, so whole entities are kept together
-    without needing the file to be grouped by S1.
+    64-bit hash. Because both are functions of the id alone, every candidate row of
+    an entity makes the same decision, so whole entities are kept together without
+    needing the file to be grouped by S1.
+
+    ``restrict_to_split=False`` reports ``in_split`` as all-true, i.e. the split
+    filter is not applied. That is what the test split needs and what an explicit
+    full-population run needs; see :func:`resolve_entity_scope` for why it is not
+    the default for the training split.
+
+    Both conditions are returned rather than their conjunction because the
+    accounting in :func:`scan_and_sample` has to attribute an excluded entity to the
+    reason it was excluded. A caller that only wants the answer wants
+    :func:`_sample_mask_for_ids`.
     """
     section = config.get("evaluation", {}).get("split", {}) or {}
     val_fraction = section.get("val_fraction", 0.2)
@@ -497,17 +607,48 @@ def _sample_mask_for_ids(
     missing = [entity_id for entity_id in unique_ids if entity_id not in cache]
     if missing:
         series = pd.Series(missing, dtype=object)
-        labels = assign_splits(series, val_fraction=val_fraction, mode=mode, seed=seed)
-        is_val = labels == "val"
+        if restrict_to_split:
+            labels = assign_splits(series, val_fraction=val_fraction, mode=mode, seed=seed)
+            in_split = labels == "val"
+        else:
+            in_split = np.ones(len(missing), dtype=bool)
         # A different slice of the same hash than assign_splits uses, so the
         # subsample is independent of the split decision.
         buckets = (stable_hash64(series) // np.uint64(1_000_000)) % np.uint64(1_000_000)
-        keep = is_val & (buckets < np.uint64(sub_threshold))
-        for entity_id, flag in zip(missing, keep):
-            cache[entity_id] = 1 if flag else 0
-    return np.fromiter(
-        (cache[entity_id] for entity_id in unique_ids), dtype=bool, count=len(unique_ids)
+        in_bucket = buckets < np.uint64(sub_threshold)
+        # Both bits are cached in one int so a later reader can count the two
+        # exclusion reasons exactly, and once, per entity.
+        for entity_id, split_flag, bucket_flag in zip(missing, in_split, in_bucket):
+            cache[entity_id] = (1 if split_flag else 0) | (2 if bucket_flag else 0)
+
+    codes = np.fromiter(
+        (cache[entity_id] for entity_id in unique_ids), dtype=np.int8, count=len(unique_ids)
     )
+    return (codes & 1).astype(bool), (codes & 2).astype(bool)
+
+
+def _sample_mask_for_ids(
+    unique_ids: np.ndarray,
+    cache: dict[str, int],
+    config: dict,
+    sub_threshold: int,
+    log: logging.Logger,
+    restrict_to_split: bool = True,
+) -> np.ndarray:
+    """Which of ``unique_ids`` are in the sample: the split filter AND the bucket.
+
+    The conjunction of :func:`_sample_decisions`, for a caller that does not need to
+    attribute an exclusion to a reason. ``scan_and_sample`` takes the two masks
+    separately instead, because its accounting counts the two reasons.
+
+    ``restrict_to_split`` defaults to ``True``, which is the training split's
+    behaviour and is load-bearing there: the matcher's validation estimate is only
+    out-of-fold because the feature file holds validation entities and nothing else.
+    """
+    in_split, in_bucket = _sample_decisions(
+        unique_ids, cache, config, sub_threshold, restrict_to_split=restrict_to_split
+    )
+    return in_split & in_bucket if restrict_to_split else in_bucket
 
 
 def scan_and_sample(
@@ -549,10 +690,18 @@ def scan_and_sample(
     sub_threshold = int(round(min(max(args.sample_fraction, 0.0), 1.0) * 1_000_000))
     chunksize = args.chunksize or int(config.get("io", {}).get("chunksize", 500_000))
 
+    entity_scope = getattr(args, "entities", ENTITY_SCOPE_AUTO)
+    restrict_to_split = resolve_entity_scope(args.split, entity_scope)
+
     log.info("scanning %s", source_path)
     log.info("  columns read : %s", ", ".join(read_columns))
     log.info("  evidence cols: %s", ", ".join(evidence_columns) or "(none)")
-    log.info("  sample       : %.3f%% of validation S1 entities", args.sample_fraction * 100.0)
+    scope_note = {
+        True: "validation entities only",
+        False: "every S1 entity in the file",
+    }[restrict_to_split]
+    log.info("  entity scope : %s (%s)", entity_scope, scope_note)
+    log.info("  sample       : %.3f%% of those entities", args.sample_fraction * 100.0)
 
     cache: dict[str, int] = {}
     counts: dict[str, int] = {}
@@ -560,6 +709,7 @@ def scan_and_sample(
     duplicate_pairs = 0
     rows_scanned = 0
     rows_sampled = 0
+    rows_in_scope = 0
     seen_entities: set[str] = set()
     rss_tracker = [0]
     sample_path = output_dir / "sample_candidates.tsv.partial"
@@ -586,10 +736,23 @@ def scan_and_sample(
             # distinct count (2.2M) instead of near the row count (336M). It is NOT a sum
             # of per-chunk distinct counts, which would double-count ids straddling chunks.
             seen_entities.update(uniques)
-            keep_by_entity = _sample_mask_for_ids(
-                uniques, cache, config, sub_threshold, log
+            # Both decisions are taken per distinct entity and then broadcast to the
+            # rows, so the row-level totals below can be attributed to a reason
+            # without a second pass and without re-deriving either mask.
+            in_split_by_entity, in_bucket_by_entity = _sample_decisions(
+                uniques,
+                cache,
+                config,
+                sub_threshold,
+                restrict_to_split=restrict_to_split,
             )
-            keep = keep_by_entity[codes] if len(keep_by_entity) else np.zeros(len(chunk), dtype=bool)
+            if len(uniques):
+                in_split = in_split_by_entity[codes]
+                keep = in_split & in_bucket_by_entity[codes]
+            else:  # pragma: no cover - an empty chunk never reaches here
+                in_split = np.zeros(len(chunk), dtype=bool)
+                keep = np.zeros(len(chunk), dtype=bool)
+            rows_in_scope += int(in_split.sum())
             if not keep.any():
                 _sample_rss(rss_tracker)
                 continue
@@ -630,14 +793,94 @@ def scan_and_sample(
         )
     sample_path.replace(output_dir / "sample_candidates.tsv")
 
+    # ---- accounting, per distinct entity, from the decision cache -------------
+    # Every entity that appeared in the candidate file is in ``cache`` exactly once,
+    # carrying two bits: in the split, and in the sample bucket. So the two exclusion
+    # reasons are counted exactly and exactly once each, and no entity is counted
+    # twice for having rows on both sides of a chunk boundary.
+    n_s1_with_candidates = len(cache)
+    excluded_by_split = sum(1 for code in cache.values() if not (code & 1))
+    excluded_by_bucket = sum(1 for code in cache.values() if (code & 1) and not (code & 2))
+    n_s1_represented = len(counts)
+
+    accounting = {
+        # The split's whole S1 population, when the manifest knows it.
+        "n_s1_input": s1_population_size(config, args.split, log),
+        # Every entity with at least one candidate row in the file.
+        "n_s1_with_candidates": n_s1_with_candidates,
+        # Those whose entities survived into the sample: one row per entity in the
+        # feature table, by construction of ``counts``.
+        "n_s1_represented_in_features": n_s1_represented,
+        # Candidate rows in the file (or in ``--limit-rows``) vs rows written.
+        "n_candidate_pairs_input": rows_scanned,
+        "n_candidate_pairs_output": rows_sampled,
+        "candidate_pairs_in_scope": rows_in_scope,
+        "candidate_pairs_excluded_by_split": rows_scanned - rows_in_scope,
+        "candidate_pairs_excluded_by_bucket": rows_in_scope - rows_sampled,
+        "entities_excluded_by_split": excluded_by_split,
+        "entities_excluded_by_bucket": excluded_by_bucket,
+        "entity_scope": entity_scope,
+        "restrict_to_split": restrict_to_split,
+        "sample_fraction": args.sample_fraction,
+        "s1_entities_seen_in_file": len(seen_entities),
+    }
+    # The invariants that make a loss loud. ``seen_entities`` is an independent
+    # recount of distinct S1 ids over the same stream, so the first one is a genuine
+    # cross-check on ``cache`` rather than a restatement of it. The second says the
+    # three entity sets are disjoint and cover the file. The third is a sanity check
+    # on the row-level broadcast of the two per-entity masks.
+    accounting["entity_count_matches_stream"] = n_s1_with_candidates == len(seen_entities)
+    accounting["entities_account_for_all"] = (
+        n_s1_with_candidates == n_s1_represented + excluded_by_split + excluded_by_bucket
+    )
+    accounting["rows_are_nested"] = 0 <= rows_sampled <= rows_in_scope <= rows_scanned
+    # The row-level invariant with teeth, and the one that would have caught the
+    # silent test-split drop: a run that asked for the whole population at the whole
+    # sample fraction must emit every row the file holds. ``None`` when the run did
+    # not ask for that, so a partial sample is not reported as a failure.
+    accounting["full_population_rows_are_lossless"] = (
+        rows_sampled == rows_scanned
+        if (not restrict_to_split and sub_threshold >= 1_000_000)
+        else None
+    )
+    accounting["ok"] = (
+        accounting["entity_count_matches_stream"]
+        and accounting["entities_account_for_all"]
+        and accounting["rows_are_nested"]
+        and accounting["full_population_rows_are_lossless"] is not False
+    )
     log.info(
         "  scanned %s rows in %.1f s (%.0f rows/s); sampled %s pairs over %s S1 entities",
         fmt_int(rows_scanned),
         scan_seconds,
         rows_scanned / max(scan_seconds, 1e-9),
         fmt_int(rows_sampled),
-        fmt_int(len(counts)),
+        fmt_int(n_s1_represented),
     )
+    log.info(
+        "  accounting   : %s S1 with candidates = %s represented + %s excluded by split"
+        " + %s excluded by sample fraction; %s candidate rows -> %s kept in scope -> %s feature rows",
+        fmt_int(n_s1_with_candidates),
+        fmt_int(n_s1_represented),
+        fmt_int(excluded_by_split),
+        fmt_int(excluded_by_bucket),
+        fmt_int(rows_scanned),
+        fmt_int(rows_in_scope),
+        fmt_int(rows_sampled),
+    )
+    if not accounting["ok"]:
+        # Logged loudly here; ``main`` turns this into a non-zero exit. It is an
+        # internal-consistency failure, so it means the scan itself lost something -
+        # which is precisely the class of bug this accounting exists to catch.
+        log.error(
+            "ACCOUNTING FAILURE at the scan: entity_count_matches_stream=%s "
+            "entities_account_for_all=%s rows_are_nested=%s "
+            "full_population_rows_are_lossless=%s - the feature table would be incomplete",
+            accounting["entity_count_matches_stream"],
+            accounting["entities_account_for_all"],
+            accounting["rows_are_nested"],
+            accounting["full_population_rows_are_lossless"],
+        )
     log_memory(log, "after scan")
 
     return {
@@ -658,6 +901,7 @@ def scan_and_sample(
         "rss_sampled_peak": rss_tracker[0],
         "sample_path": output_dir / "sample_candidates.tsv",
         "sample_fraction": args.sample_fraction,
+        "accounting": accounting,
     }
 
 
@@ -1175,6 +1419,7 @@ def _extract_features_single(
         rss_tracker=rss_tracker,
         sample_path=scan["sample_path"],
         workers=1,
+        n_s1_entities_written=len(sample_counts),
     )
 
 
@@ -1192,12 +1437,17 @@ def _finish_feature_result(
     shard_seconds: float = 0.0,
     merge_seconds: float = 0.0,
     parallel: Optional[dict[str, Any]] = None,
+    n_s1_entities_written: Optional[int] = None,
 ) -> dict[str, Any]:
     """Assemble the phase-2 result dict, shared by both execution paths.
 
     Keeping this in one place is what makes ``--workers 1`` and ``--workers N``
     comparable: every key has the same meaning in both, and the report builder
     never has to ask which path produced it.
+
+    ``n_s1_entities_written`` is the number of distinct S1 entities the written
+    feature file actually holds - measured by the path that wrote it, not inferred
+    from the scan's plan. It is what the accounting compares the plan against.
     """
     peak = peak_rss_bytes()
     peak_value, peak_source = _peak_description(peak, rss_tracker[0])
@@ -1211,6 +1461,7 @@ def _finish_feature_result(
 
     return {
         **stats.as_dict(),
+        "n_s1_entities": n_s1_entities_written,
         "feature_seconds": feature_seconds,
         "shard_seconds": shard_seconds,
         "merge_seconds": merge_seconds,
@@ -1375,6 +1626,7 @@ def _empty_worker_result(index: int, feature_path: Path) -> dict[str, Any]:
         "count_mismatches": 0,
         "count_mismatch_examples": {},
         "n_s1_entities": 0,
+        "n_s1_entities_written": 0,
         "n_target_ids": {},
     }
 
@@ -1488,6 +1740,7 @@ def _feature_worker(payload: dict[str, Any]) -> dict[str, Any]:
         "count_mismatches": len(mismatches) + extra_in_partition,
         "count_mismatch_examples": {str(k): v for k, v in list(mismatches.items())[:5]},
         "n_s1_entities": len(worker_counts),
+        "n_s1_entities_written": len(sample_counts),
         "n_target_ids": {label: len(ids) for label, ids in sorted(targets.items())},
     }
 
@@ -1717,6 +1970,9 @@ def _extract_features_parallel(
         shard_seconds=float(shards["shard_seconds"]),
         merge_seconds=merge_seconds,
         parallel=parallel,
+        # Partitions are disjoint by construction (``partition_entities``), so the
+        # sum of the workers' own written-entity counts is the file's entity count.
+        n_s1_entities_written=sum(int(r["n_s1_entities_written"]) for r in ordered),
     )
     # ``peak_rss_value`` is the largest *single* process's high-water mark (the
     # parent or one worker) - what a per-process memory limit is checked against,
@@ -1802,6 +2058,23 @@ def summarize(
             "rows_scanned": scan["rows_scanned"],
             "sample_fraction": scan["sample_fraction"],
             "sample_candidates_file_rows": rows,
+        },
+        # The explicit entity accounting. Every S1 in the candidate file is either
+        # represented in the feature table or excluded for one of exactly two named,
+        # counted reasons, and the counters are asserted to add up - so a run that
+        # silently loses entities fails here instead of producing a feature table
+        # that is quietly missing most of the test set.
+        "accounting": {
+            **{key: value for key, value in scan["accounting"].items() if key != "ok"},
+            "n_s1_represented_in_feature_file": features["n_s1_entities"],
+            "n_candidate_pairs_output_measured": rows,
+            "represented_entities_agree": (
+                features["n_s1_entities"] == scan["accounting"]["n_s1_represented_in_features"]
+            ),
+            "pairs_agree": rows == scan["accounting"]["n_candidate_pairs_output"],
+            "ok": scan["accounting"]["ok"]
+            and features["n_s1_entities"] == scan["accounting"]["n_s1_represented_in_features"]
+            and rows == scan["accounting"]["n_candidate_pairs_output"],
         },
         "timing": {
             "scan_seconds": round(scan["scan_seconds"], 2),
@@ -2017,12 +2290,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--data-root", default=None)
     parser.add_argument("--work-dir", default=None)
     parser.add_argument("--split", default="train", choices=["train", "test"])
+    parser.add_argument(
+        "--entities",
+        default=ENTITY_SCOPE_AUTO,
+        choices=list(ENTITY_SCOPES),
+        help="which S1 entities the run may emit rows for. 'auto' (default): the "
+        "training split keeps only validation entities, because the matcher's val "
+        "macro F0.5 is out-of-fold only if the feature file holds validation "
+        "entities and nothing else; the test split keeps every entity with "
+        "candidates, because it has no ground truth and its whole population has to "
+        "be predicted. 'val' forces the validation filter, 'all' forces the whole "
+        "population (+ any --sample-fraction)",
+    )
     parser.add_argument("--candidates", default="candidate_pairs", help="candidate file stem")
     parser.add_argument(
         "--sample-fraction",
         type=float,
         default=0.03,
-        help="fraction of VALIDATION S1 entities to sample (whole entities). "
+        help="fraction of the in-scope S1 entities to sample (whole entities). "
         "0.03 of a 20%% val split is ~13k entities, ~2M candidate pairs",
     )
     parser.add_argument("--chunksize", type=int, default=None, help="candidate rows per chunk")
@@ -2055,6 +2340,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     validate_workers(parser, args.workers)
     return args
+
+
+def accounting_failures(report: dict[str, Any]) -> dict[str, Any]:
+    """The accounting checks that failed, by name. Empty means the run accounted.
+
+    Only checks that came back ``False`` are named; ``None`` means "not applicable
+    to this run" (the lossless-rows check does not apply to a partial sample) and is
+    not a failure. ``main`` turns a non-empty result into a non-zero exit, so this
+    is the single place that decides whether the feature table is trustworthy.
+    """
+    return {
+        key: value
+        for key, value in report.get("accounting", {}).items()
+        if value is False
+    }
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -2098,6 +2398,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report["inputs"] = {
         "candidates": scan["source_path"],
         "split": args.split,
+        "entities": args.entities,
+        "restrict_to_split": scan["accounting"]["restrict_to_split"],
         "sample_fraction": args.sample_fraction,
         "workers": int(args.workers),
         "chunksize": args.chunksize,
@@ -2114,11 +2416,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # rows, elapsed, memory and throughput in one place.
     log.info("-" * 78)
     log.info("workers          : %d", report["inputs"]["workers"])
+    log.info("entity scope     : %s (%s)", args.entities,
+             "validation entities only" if scan["accounting"]["restrict_to_split"]
+             else "every S1 entity with candidates")
     log.info("selected S1      : %s", fmt_int(report["sample"]["n_s1_entities_sampled"]))
     log.info(
         "candidate pairs  : %s sampled / %s scanned",
         fmt_int(report["sample"]["n_candidate_pairs_sampled"]),
         fmt_int(report["sample"]["rows_scanned"]),
+    )
+    log.info(
+        "S1 accounting    : %s with candidates -> %s in features (%s excluded by split, "
+        "%s by sample fraction)",
+        fmt_int(report["accounting"]["n_s1_with_candidates"]),
+        fmt_int(report["accounting"]["n_s1_represented_in_features"]),
+        fmt_int(report["accounting"]["entities_excluded_by_split"]),
+        fmt_int(report["accounting"]["entities_excluded_by_bucket"]),
     )
     log.info("feature rows     : %s", fmt_int(features["rows_featurized"]))
     log.info("elapsed          : %.1f s", report["timing"]["total_seconds"])
@@ -2140,6 +2453,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if features["out_of_range"]:
         log.error("unit-interval features outside [0, 1]: %s", features["out_of_range"])
+        return 1
+    if not report["accounting"]["ok"]:
+        # The loud failure. A run that emitted a feature table short of the entities
+        # it was supposed to cover would otherwise score plausibly and be believed;
+        # instead every counter that disagreed is printed and the exit is non-zero.
+        log.error(
+            "ACCOUNTING FAILURE: the feature table does not account for the entities it "
+            "was asked to cover.%s"
+            "  n_s1_with_candidates=%s  n_s1_represented_in_features=%s  "
+            "entities_excluded_by_split=%s  entities_excluded_by_bucket=%s | "
+            "n_candidate_pairs_input=%s  n_candidate_pairs_output=%s",
+            "" if report["accounting"].get("n_s1_input") is None
+            else f"  (split holds {fmt_int(report['accounting']['n_s1_input'])} S1 entities)",
+            fmt_int(report["accounting"]["n_s1_with_candidates"]),
+            fmt_int(report["accounting"]["n_s1_represented_in_features"]),
+            fmt_int(report["accounting"]["entities_excluded_by_split"]),
+            fmt_int(report["accounting"]["entities_excluded_by_bucket"]),
+            fmt_int(report["accounting"]["n_candidate_pairs_input"]),
+            fmt_int(report["accounting"]["n_candidate_pairs_output"]),
+        )
+        log.error("failed checks: %s", accounting_failures(report))
         return 1
     if features["integrity"].get("count_mismatches"):
         return 1
