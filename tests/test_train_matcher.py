@@ -47,12 +47,13 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data_loader import load_ground_truth  # noqa: E402
+from src.data_loader import GroundTruth, load_ground_truth  # noqa: E402
 from src.evaluation import CandidateEvaluation  # noqa: E402
 from src.matching_model import (  # noqa: E402
     FEATURE_COLUMNS,
     FEATURE_DTYPES,
     ID_COLUMNS,
+    MAX_FOLDS,
     NON_FEATURE_COLUMNS,
     ModelBundle,
     aggregate_matches,
@@ -156,8 +157,15 @@ def _config() -> dict:
     }
 
 
-def _make_fixture(root: Path) -> dict:
-    """Write the ground truth and the feature file, with the chunk boundary inside S1-5."""
+def _make_fixture(root: Path, skip_s1: tuple[str, ...] = ()) -> dict:
+    """Write the ground truth and the feature file, with the chunk boundary inside S1-5.
+
+    ``skip_s1`` drops those entities' *candidate rows* only - the ground truth keeps
+    them. That is the real shape of a run: the ground truth is every S1 entity in the
+    competition, while a feature file is the candidates the blockers proposed, so some
+    entities have no rows at all. It is also what made the purity check fail on HPC
+    (see ``test_fold_purity_ignores_ground_truth_entities_without_candidate_rows``).
+    """
     ground_truth_path = root / "ground_truth.tsv"
     _write_tsv(
         ground_truth_path,
@@ -169,6 +177,8 @@ def _make_fixture(root: Path) -> dict:
     header = list(ID_COLUMNS) + list(FEATURE_COLUMNS) + list(NON_FEATURE_COLUMNS)
     rows = []
     for s1, target, source, ratio, _label, token_df in FEATURE_ROWS:
+        if s1 in skip_s1:
+            continue
         values = {name: 0 for name in FEATURE_COLUMNS}
         values["name_token_set_ratio"] = ratio
         values["source_is_s2"] = 1 if source == "S2" else 0
@@ -512,18 +522,229 @@ def test_fold_purity_assertion_catches_a_row_level_split():
     """The guard has to fire on a row-level split, or it is not a guard.
 
     A row-level fold assignment is the exact bug that would inflate the score, so the
-    assertion is given one deliberately.
+    assertion is given one deliberately. The count must be exactly one entity: entity 1
+    is pure and must not be swept up with it, or a real leak's size becomes unreadable.
     """
     owners = np.array([0, 0, 0, 1], dtype=np.int64)
     split_by_row = np.array([0, 1, 0, 0], dtype=np.int8)  # entity 0 spans folds 0 and 1
     try:
         assert_fold_purity(split_by_row, owners, 2)
     except ValueError as exc:
-        assert "more than one fold" in str(exc), f"unexpected message: {exc}"
+        message = str(exc)
+        assert "more than one fold" in message, f"unexpected message: {exc}"
+        assert message.startswith("1 S1 entities"), f"exactly one entity is impure: {message}"
+        assert "2 entities own candidate rows in this run" in message, (
+            f"the message must state what it actually examined: {message}"
+        )
     else:
         raise AssertionError("a row-level split must be rejected")
 
     assert_fold_purity(np.array([1, 1, 1, 0], dtype=np.int8), owners, 2)  # pure is fine
+
+
+def test_fold_purity_ignores_ground_truth_entities_without_candidate_rows():
+    """The HPC shakedown failure, in miniature - the root cause of it.
+
+    A feature file holds one split's candidates; the ground truth holds every S1 entity
+    in the competition. So most ground-truth entities own no candidate rows, and one of
+    them sitting *inside* the range the check walks leaves a hole in it. The body used
+    to start its min/max accumulators at ``(n_folds, -1)``, so every hole read as "this
+    entity spans two folds" and a perfectly grouped assignment was rejected, reporting
+
+        (highest owner position + 1) - (entities owning rows)
+
+    which grows with the ground truth, not with any leak. On the HPC run that was
+    2,194,111 "impure" entities. Here S1-10 (position 1) is the entity the feature file
+    has no rows for, and it is the hole the old body counted.
+    """
+    fixture = _make_fixture(_temp_dir(), skip_s1=("S1-10",))
+    ground_truth = fixture["ground_truth"]
+    owners = _load_artifacts(fixture)["owners"].astype(np.int64)
+    entity_folds = assign_folds(ground_truth, n_folds=FIXTURE_FOLDS, mode="hash")
+    row_folds = entity_folds[owners]
+
+    # Preconditions for the regression. The ground truth must keep the entity the
+    # feature file skips, and that entity's position must be *inside* the checked range:
+    # put it past the end and the old code missed it too, so the test would pass for the
+    # wrong reason.
+    assert ground_truth.n_entities == len(GROUND_TRUTH_ROWS), "the ground truth keeps all four"
+    covered = set(np.unique(owners).tolist())
+    assert 1 not in covered, "S1-10 must own no candidate rows"
+    assert max(covered) > 1, "the hole has to be interior, not past the end of the range"
+
+    # What the old body reported, reconstructed: exactly the one hole, nothing else.
+    old_low = np.full(int(owners.max()) + 1, FIXTURE_FOLDS, dtype=np.int8)
+    old_high = np.full(int(owners.max()) + 1, -1, dtype=np.int8)
+    np.minimum.at(old_low, owners, row_folds)
+    np.maximum.at(old_high, owners, row_folds)
+    assert int(np.count_nonzero(old_low != old_high)) == 1, (
+        "the false positive is the entity with no rows, and it is the only one"
+    )
+
+    counts = assert_fold_purity(row_folds, owners, FIXTURE_FOLDS)  # must not raise
+    assert counts["rows"] == len(owners)
+    assert counts["entity_index_span"] == int(owners.max()) + 1
+    assert counts["entities_checked"] == 3, "three of the four entities own rows"
+
+    # The grouping itself is unchanged and still holds per entity.
+    for position in np.unique(owners):
+        assert len(np.unique(row_folds[owners == position])) == 1
+
+
+def test_fold_purity_rejects_misaligned_rows_unknown_owners_and_bad_fold_ids():
+    """The three inputs that would make the reductions above lie, rather than raise.
+
+    A negative owner wraps onto a real entity, and a fold id outside ``[0, n_folds)``
+    collides with the ``n_folds`` sentinel - either would turn a leak into a pass, so
+    both are rejected instead of being reduced over.
+    """
+    owners = np.array([0, 0, 1], dtype=np.int64)
+    folds = np.array([0, 0, 1], dtype=np.int8)
+
+    try:
+        assert_fold_purity(folds[:2], owners, 2)
+    except ValueError as exc:
+        assert "row-aligned" in str(exc), f"unexpected message: {exc}"
+    else:
+        raise AssertionError("misaligned inputs must be rejected")
+
+    unknown = np.array([0, -1, 1], dtype=np.int64)
+    try:
+        assert_fold_purity(folds, unknown, 2)
+    except ValueError as exc:
+        assert "negative owner index" in str(exc), f"unexpected message: {exc}"
+    else:
+        raise AssertionError("an unknown S1 id must be rejected, not wrapped onto entity -1")
+
+    for bad in (np.array([0, 0, 2], dtype=np.int8), np.array([0, 0, -1], dtype=np.int8)):
+        try:
+            assert_fold_purity(bad, owners, 2)
+        except ValueError as exc:
+            assert "fold ids must be in" in str(exc), f"unexpected message: {exc}"
+        else:
+            raise AssertionError(f"fold ids {bad.tolist()} must be rejected")
+
+
+def test_one_to_many_entities_keep_every_row_in_one_fold():
+    """One S1 with several candidates, checked per entity *and* per fold.
+
+    An entity that legitimately matches three targets has three candidate rows, and a
+    partial-fold bug is easy to miss: each row still reads as "some fold", and only the
+    reverse statement - no fold holds a strict subset of an entity's rows - shows it.
+    Both fold modes are checked, including ``auto``, because ``auto`` is what a real run
+    takes.
+    """
+    root = _temp_dir()
+    ground_truth_rows = [
+        ("S1-1", "S2-1,S2-2,S2-3"),
+        ("S1-2", "S2-4,S2-5"),
+        ("S1-3", "S2-6"),
+        ("S1-4", "S2-7,S2-8"),
+        ("S1-5", "S2-9,S2-10"),
+    ]
+    # (s1, target) - several candidates per entity, true and false mixed.
+    candidate_rows = [
+        ("S1-1", "S2-1", 1),
+        ("S1-1", "S2-2", 1),
+        ("S1-1", "S2-3", 1),
+        ("S1-1", "S2-90", 0),
+        ("S1-2", "S2-4", 1),
+        ("S1-2", "S2-5", 1),
+        ("S1-3", "S2-6", 1),
+        ("S1-3", "S2-91", 0),
+        ("S1-4", "S2-7", 1),
+        ("S1-4", "S2-8", 1),
+        ("S1-4", "S2-92", 0),
+        ("S1-5", "S2-9", 1),
+        ("S1-5", "S2-10", 1),
+    ]
+    ground_truth_path = root / "ground_truth.tsv"
+    features_path = root / "features.tsv"
+    _write_tsv(
+        ground_truth_path,
+        ["source1_entity_id", "matched_entity_ids"],
+        [[s1, matches] for s1, matches in ground_truth_rows],
+    )
+    header = list(ID_COLUMNS) + list(FEATURE_COLUMNS) + list(NON_FEATURE_COLUMNS)
+    rows = []
+    for s1, target, ratio in candidate_rows:
+        values = {name: 0 for name in FEATURE_COLUMNS}
+        values["name_token_set_ratio"] = float(ratio)
+        values["source_is_s2"] = 1
+        rows.append([s1, target, "S2"] + [values[name] for name in FEATURE_COLUMNS] + [1])
+    _write_tsv(features_path, header, rows)
+
+    ground_truth = load_ground_truth(_config(), path=ground_truth_path)
+    artifacts = build_label_artifacts(features_path, ground_truth, _temp_dir() / "labels", chunksize=5)
+    owners = np.load(Path(artifacts["owner_index_path"])).astype(np.int64)
+    labels = np.load(Path(artifacts["labels_path"]))
+
+    # The fixture really is one-to-many, in the rows and in the labels.
+    rows_per_entity = [int((owners == position).sum()) for position in range(ground_truth.n_entities)]
+    assert rows_per_entity == [4, 2, 2, 3, 2], f"unexpected rows per entity: {rows_per_entity}"
+    assert int(labels.sum()) == 10, "ten of the thirteen candidates are true pairs"
+
+    modes = ["hash", "auto"] if _sklearn_available() else ["hash"]
+    for mode in modes:
+        entity_folds = assign_folds(ground_truth, n_folds=FIXTURE_FOLDS, mode=mode)
+        row_folds = entity_folds[owners]
+        assert_fold_purity(row_folds, owners, FIXTURE_FOLDS)  # must not raise
+
+        for position in range(ground_truth.n_entities):
+            rows_of_entity = owners == position
+            folds_of_entity = np.unique(row_folds[rows_of_entity])
+            assert len(folds_of_entity) == 1, (
+                f"mode={mode}: entity at position {position} spans folds "
+                f"{folds_of_entity.tolist()} across its {int(rows_of_entity.sum())} rows"
+            )
+            # Reverse statement: for every fold, this entity is either entirely in it or
+            # entirely out of it - never partly.
+            for fold in range(FIXTURE_FOLDS):
+                in_fold = row_folds[rows_of_entity] == fold
+                assert in_fold.all() or not in_fold.any(), (
+                    f"mode={mode}: fold {fold} holds {int(in_fold.sum())} of entity "
+                    f"{position}'s {int(rows_of_entity.sum())} rows"
+                )
+
+        # And the form that matters for training: the entities a fold is scored on are
+        # absent from everything it trains on.
+        for fold in range(FIXTURE_FOLDS):
+            held_out = row_folds == fold
+            assert not np.intersect1d(owners[held_out], owners[~held_out]).size, (
+                f"mode={mode}: fold {fold} trained on entities it is being scored on"
+            )
+
+
+def test_fold_ids_survive_more_folds_than_int8_can_hold():
+    """``--folds`` past 127 used to wrap the fold id into a negative one.
+
+    ``assign_folds`` reads a negative id as "this entity was never assigned" and re-places
+    it by hash, which is a silent entity split - the same class of bug as the HPC one,
+    reachable from a CLI flag. Fold ids are ``int16`` and the count is bounded explicitly.
+
+    The entity count is what makes 130 folds fillable by hash at all: ``assign_folds``
+    refuses to leave a fold empty, and ~15 entities per fold is the average here.
+    """
+    n_entities = 2_000
+    lengths = np.ones(n_entities, dtype=np.int64)
+    offsets = np.zeros(n_entities + 1, dtype=np.int64)
+    np.cumsum(lengths, out=offsets[1:])
+    codes = np.arange(1, n_entities + 1, dtype=np.int64)
+    entity_ids = np.array([f"S1-{i + 1}" for i in range(n_entities)], dtype=object)
+    ground_truth = GroundTruth(entity_ids, offsets, codes)
+
+    folds = assign_folds(ground_truth, n_folds=130, mode="hash")
+    assert folds.min() >= 0, "a wrapped fold id reads as unassigned"
+    assert folds.max() < 130
+    counts = np.bincount(folds.astype(np.int64), minlength=130)
+    assert (counts > 0).all(), "every fold must own an entity"
+
+    try:
+        assign_folds(ground_truth, n_folds=MAX_FOLDS + 1, mode="hash")
+    except ValueError as exc:
+        assert "n_folds must be <=" in str(exc), f"unexpected message: {exc}"
+    else:
+        raise AssertionError("an out-of-range fold count must be rejected, not wrapped")
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1279,111 @@ def test_oof_probabilities_are_filled_for_every_row_and_never_negative():
         probabilities[row_folds == fold] = 0.5
     assert int(np.count_nonzero(probabilities < 0)) == 0
     assert np.allclose(probabilities, 0.5)
+
+
+def test_every_entity_is_scored_by_a_model_that_never_saw_the_entity():
+    """Out-of-fold stated per S1 entity, against the *saved* models.
+
+    This follows from fold purity, which is why it is worth asserting on its own: it is
+    the property the whole design exists to protect, and it is checked against the models
+    that produced the scores rather than against the fold array. A prediction step that
+    quietly used the ensemble - fitted on every row - would pass a fold-array check and
+    fail here.
+
+    The ``threshold`` arm fits nothing at all, so there is no training set for it to
+    leak from; it is covered by its own end-to-end test.
+    """
+    if not _has_lightgbm():
+        return
+
+    fixture = _make_fixture(_temp_dir())
+    out_dir = _temp_dir() / "run_oof_entity"
+    bundle = train(
+        fixture["config"],
+        fixture["features_path"],
+        out_dir,
+        ground_truth=fixture["ground_truth"],
+        model="lightgbm",
+        folds=FIXTURE_FOLDS,
+        fold_mode="hash",
+        n_estimators=20,
+        params={**default_params(seed=42), "min_data_in_leaf": 1},
+        chunksize=4,
+    )
+
+    oof = np.load(out_dir / "oof_probabilities.npy")
+    owners = np.load(out_dir / "val_owner_index.npy").astype(np.int64)
+    matrix = np.load(out_dir / "val_features.npy")
+    entity_folds = assign_folds(fixture["ground_truth"], n_folds=FIXTURE_FOLDS, mode="hash")
+    row_folds = entity_folds[owners]
+
+    for position in np.unique(owners):
+        rows = np.flatnonzero(owners == position)
+        fold = int(entity_folds[position])
+        assert len(np.unique(row_folds[rows])) == 1, (
+            f"entity at position {position} spans folds {np.unique(row_folds[rows]).tolist()}"
+        )
+        # Its scores come from that fold's model - and no other model could have
+        # produced them, because the ensemble is a different function.
+        assert np.allclose(
+            oof[rows], bundle.boosters[fold].predict(matrix[rows]), atol=1e-6
+        ), f"entity {position} was not scored by fold {fold}'s model"
+        # And that model did not train on this entity: none of its rows is in the mask
+        # the fold's own booster was fitted on.
+        trained_on = row_folds != fold
+        assert not trained_on[rows].any(), (
+            f"entity {position} is inside fold {fold}'s training mask while being scored by it"
+        )
+
+    # The same statement the other way round: no entity is on both sides of a fold.
+    for fold in range(FIXTURE_FOLDS):
+        held_out = row_folds == fold
+        assert not np.intersect1d(owners[held_out], owners[~held_out]).size
+
+
+def test_training_survives_a_ground_truth_entity_the_features_do_not_cover():
+    """The failing HPC command in miniature, through the whole ``train()`` path.
+
+    The ground truth has four entities and the feature file has rows for three, because
+    the blockers proposed nothing for S1-10. That is ordinary - it is what the blocking
+    recall number measures - and the run must complete. It also must not drop the
+    uncovered entity from the metric: its one true match is unreachable, so it scores 0
+    rather than being averaged away.
+    """
+    fixture = _make_fixture(_temp_dir(), skip_s1=("S1-10",))
+    out_dir = _temp_dir() / "run_uncovered"
+
+    bundle = train(
+        fixture["config"],
+        fixture["features_path"],
+        out_dir,
+        ground_truth=fixture["ground_truth"],
+        model="threshold",
+        score_feature="name_token_set_ratio",
+        folds=FIXTURE_FOLDS,
+        fold_mode="hash",
+        chunksize=4,
+    )
+    metrics = bundle.metrics
+
+    # The check reports what it examined, so this state is visible in the run rather
+    # than implied: three of the four ground-truth entities own candidate rows.
+    assert metrics["fold_purity"] == {
+        "rows": 8,
+        "entities_checked": 3,
+        "entity_index_span": 4,
+    }
+    assert metrics["labels"]["n_s1_entities_in_ground_truth"] == 4
+    assert metrics["labels"]["n_s1_entities_with_rows"] == 3
+    assert metrics["rows"] == 8
+
+    # S1-5 -> 1.0, S1-16 (no true match, nothing predicted) -> 1.0, S1-3 -> 5/6,
+    # S1-10 -> 0.0: nothing was predicted and it has a true match, so it is a miss.
+    expected = (1.0 + 0.0 + 1.0 + (5.0 / 6.0)) / 4.0
+    assert abs(metrics["val_metrics"]["macro_f05_score_zero"] - expected) < 1e-9, (
+        f"macro F0.5 {metrics['val_metrics']['macro_f05_score_zero']} != {expected}"
+    )
+    assert metrics["val_metrics"]["predicted_pairs"] == 4
 
 
 def test_entity_metrics_report_one_to_many_without_truncating():

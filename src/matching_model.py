@@ -286,6 +286,14 @@ FOLD_MODES = (FOLD_MODE_AUTO, FOLD_MODE_HASH, FOLD_MODE_GROUPKFOLD)
 ZERO_MATCH_POLICY = "score_zero"
 OTHER_POLICY = "exclude"
 
+# Per-entity fold ids. ``int16`` rather than ``int8``: with ``int8`` a fold count above
+# 127 wraps to a negative id, which ``assign_folds`` reads as "this entity was never
+# assigned" and silently re-places by hash - an entity split across folds, from a CLI
+# flag. 32,767 folds is far past any real use, and the guard in ``assign_folds`` says so
+# explicitly rather than letting the wrap happen.
+FOLD_DTYPE = np.int16
+MAX_FOLDS = int(np.iinfo(FOLD_DTYPE).max)
+
 LIGHTGBM_MISSING_MESSAGE = (
     "LightGBM is required for --model lightgbm but is not installed.\n"
     "  pip install lightgbm            # MIT licence, CPU by default\n"
@@ -690,6 +698,11 @@ def assign_folds(
     """
     if n_folds < 2:
         raise ValueError(f"n_folds must be >= 2, got {n_folds}")
+    if n_folds > MAX_FOLDS:
+        # Fold ids have to survive the round trip through FOLD_DTYPE. Checked here
+        # because an overflowing id reads as "unassigned" downstream and would be
+        # re-placed by hash - splitting an entity across folds instead of failing.
+        raise ValueError(f"n_folds must be <= {MAX_FOLDS}, got {n_folds}")
     resolved = resolve_fold_mode(mode)
 
     fold_of_entity: Optional[np.ndarray] = None
@@ -734,7 +747,7 @@ def assign_folds(
 
 def _folds_from_hash(entity_ids: np.ndarray, n_folds: int) -> np.ndarray:
     hashed = stable_hash64(entity_ids).astype(np.uint64) % np.uint64(n_folds)
-    return hashed.astype(np.int8)
+    return hashed.astype(FOLD_DTYPE)
 
 
 def _folds_groupkfold(ground_truth: GroundTruth, n_folds: int) -> np.ndarray:
@@ -749,7 +762,7 @@ def _folds_groupkfold(ground_truth: GroundTruth, n_folds: int) -> np.ndarray:
     lengths = ground_truth.lengths()
     n_entities = len(lengths)
     rows = np.repeat(np.arange(n_entities, dtype=np.int64), lengths)
-    fold_of_entity = np.full(n_entities, -1, dtype=np.int8)
+    fold_of_entity = np.full(n_entities, -1, dtype=FOLD_DTYPE)
     if len(rows) < n_folds:
         raise ValueError(f"cannot make {n_folds} folds from {len(rows)} ground-truth pairs")
     splitter = GroupKFold(n_splits=n_folds)
@@ -767,25 +780,99 @@ def _sklearn_available() -> bool:
     return True
 
 
-def assert_fold_purity(row_folds: np.ndarray, owners: np.ndarray, n_folds: int) -> None:
+def assert_fold_purity(
+    row_folds: np.ndarray,
+    owners: np.ndarray,
+    n_folds: int,
+    log: Optional[logging.Logger] = None,
+) -> dict[str, int]:
     """Fail loudly if any S1 entity's rows span more than one fold.
 
     The construction (``row_folds = entity_folds[owner]``) makes this true by
     definition, which is exactly why it is worth asserting: if a future refactor ever
     computes folds per row, this is the check that catches the leak instead of a
     validation score that is quietly too good.
+
+    **Only entities that own candidate rows are examined.** The ground truth holds
+    every S1 entity in the competition - 2.2M of them in this dataset, including
+    123,247 that match nothing - while a feature file is one split's worth of
+    candidates and covers a fraction of that. An entity with no rows has nothing to
+    keep together and cannot leak, but it does have an entry in the per-entity
+    reduction, so counting it is a false positive. That is what this check used to do:
+    ``low`` started at ``n_folds`` and ``high`` at ``-1``, so every *untouched*
+    position read as "spans two folds", and a perfectly grouped assignment failed with:
+
+        impure == (highest owner position + 1) - (entities owning rows)
+
+    - a number that grows with the ground truth rather than with any leak. On the
+    2M-row HPC shakedown it reported 2,194,111 "impure" entities while every entity
+    sat in exactly one fold. ``high >= 0`` marks the entities that were actually
+    reduced over, so nothing outside that set is counted.
+
+    Returns the counts, so a run's log and metrics can state how much of the ground
+    truth the check actually covered instead of implying all of it.
     """
-    n_entities = int(owners.max()) + 1 if len(owners) else 0
-    low = np.full(n_entities, n_folds, dtype=np.int8)
-    high = np.full(n_entities, -1, dtype=np.int8)
+    row_folds = np.asarray(row_folds)
+    owners = np.asarray(owners)
+    if row_folds.shape != owners.shape:
+        raise ValueError(
+            f"row_folds and owners must be row-aligned: {row_folds.shape} vs {owners.shape}"
+        )
+    if n_folds < 1:
+        raise ValueError(f"n_folds must be >= 1, got {n_folds}")
+    n_rows = int(owners.size)
+    if not n_rows:
+        return {"rows": 0, "entities_checked": 0, "entity_index_span": 0}
+
+    # -1 is what label_pairs returns for an S1 id the ground truth does not contain.
+    # Such a row must be dropped before this point, because a negative index wraps onto
+    # a real entity in the two reductions below and would look like a leak.
+    unknown = int(np.count_nonzero(owners < 0))
+    if unknown:
+        raise ValueError(
+            f"{fmt_int(unknown)} rows have a negative owner index (an S1 id absent from "
+            "the ground truth); they must be dropped before folds are checked"
+        )
+    # Every entity must have been assigned a fold, and a fold id must be in range: the
+    # ``n_folds`` sentinel below is only distinguishable from a real id while this holds.
+    if int(row_folds.min()) < 0 or int(row_folds.max()) >= n_folds:
+        raise ValueError(
+            f"fold ids must be in [0, {n_folds}), got [{int(row_folds.min())}, "
+            f"{int(row_folds.max())}] - an out-of-range id means an entity was never assigned"
+        )
+
+    n_entities = int(owners.max()) + 1
+    low = np.full(n_entities, n_folds, dtype=np.int32)
+    high = np.full(n_entities, -1, dtype=np.int32)
     np.minimum.at(low, owners, row_folds)
     np.maximum.at(high, owners, row_folds)
-    impure = int(np.count_nonzero(low != high))
+
+    with_rows = high >= 0
+    entities_with_rows = int(np.count_nonzero(with_rows))
+    impure = int(np.count_nonzero(with_rows & (low != high)))
+    counts = {
+        "rows": n_rows,
+        "entities_checked": entities_with_rows,
+        # The highest owner position this run reaches, +1. Equal to the ground truth's
+        # entity count only when its last position happens to own a row; the ground
+        # truth's own size is logged by train() and recorded in the labels report.
+        "entity_index_span": n_entities,
+    }
     if impure:
         raise ValueError(
             f"{fmt_int(impure)} S1 entities have candidates in more than one fold - "
-            "folds must be grouped by entity, never by pair"
+            "folds must be grouped by entity, never by pair "
+            f"({fmt_int(entities_with_rows)} entities own candidate rows in this run, and "
+            "those are the ones checked)"
         )
+    if log:
+        log.info(
+            "entity-fold purity: %s entities own candidate rows in this run, and all %s of "
+            "them sit in exactly one fold",
+            fmt_int(entities_with_rows),
+            fmt_int(entities_with_rows),
+        )
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -1424,7 +1511,9 @@ def train(
         ground_truth, n_folds=folds, mode=fold_mode, seed=seed, log=log, report=fold_report
     )
     row_folds = entity_folds[owners]
-    assert_fold_purity(row_folds, owners, folds)
+    # The check covers the entities this run has candidates for, not the whole ground
+    # truth - see assert_fold_purity for why counting the rest is a false positive.
+    purity = assert_fold_purity(row_folds, owners, folds, log=log)
 
     # -- 3. out-of-fold scores ---------------------------------------------
     probabilities = np.full(n_rows, -1.0, dtype=np.float32)
@@ -1593,6 +1682,7 @@ def train(
         "fold_entities": fold_report.get("entities_per_fold", []),
         "fold_rows": _counts_per_fold(row_folds, folds),
         "fold_positives": [int(is_true[row_folds == k].sum()) for k in range(folds)],
+        "fold_purity": purity,
         "params": _jsonable(resolved_params),
         "n_estimators": int(n_estimators) if model == MODEL_LIGHTGBM else 0,
         "per_fold": per_fold,
@@ -1987,8 +2077,20 @@ def _log_summary(log: logging.Logger, metrics: dict[str, Any]) -> None:
         fmt_int(metrics["negative_labels"]),
         100.0 * metrics["positive_rate"],
     )
-    log.info("  S1 entities with rows    : %s", fmt_int(metrics["n_s1_entities_with_rows"]))
+    log.info(
+        "  S1 entities with rows    : %s of %s in the ground truth",
+        fmt_int(metrics["n_s1_entities_with_rows"]),
+        fmt_int((metrics.get("labels") or {}).get("n_s1_entities_in_ground_truth") or 0),
+    )
     log.info("  folds                    : %s (%s)", metrics["n_folds"], metrics["fold_mode"])
+    purity = metrics.get("fold_purity") or {}
+    if purity:
+        # Printed because it is the coverage of the leakage check, not a formality: the
+        # rest of the ground truth has no candidate rows in this run to keep together.
+        log.info(
+            "  entity-fold purity       : %s entities checked, each in exactly one fold",
+            fmt_int(purity.get("entities_checked", 0)),
+        )
     log.info(
         "  threshold                : %.6g  (plateau %s points, %s)",
         metrics["threshold"],
